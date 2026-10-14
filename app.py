@@ -204,7 +204,7 @@ with gr.Blocks(title=APP_TITLE, theme=gr.themes.Soft()) as demo:
         "Votre assistant intelligent — conversation, analyse de documents et d'images."
     )
     history_state = gr.State([])
-    chat = gr.Chatbot(label="Conversation", type="messages", height=520)
+    chat = gr.Chatbot(label="Conversation", height=520)
     attachments = gr.File(
         label="Joindre des images ou documents",
         file_count="multiple",
