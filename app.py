@@ -1,7 +1,7 @@
 import os
 import json
 import csv
-import tempfile
+import asyncio
 from pathlib import Path
 
 import gradio as gr
@@ -19,50 +19,39 @@ SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY") or os.getenv("SUPABASE_ANON_KEY")
 
 if not GEMINI_API_KEY:
-    raise RuntimeError(
-        "Clé Gemini absente. Configure GEMINI_API_KEY dans les variables d'environnement."
-    )
+    raise RuntimeError("Clé Gemini absente. Configure GEMINI_API_KEY dans les variables d'environnement.")
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 INSTRUCTIONS = """
 Tu es AYZORA AI, un assistant intelligent et professionnel.
-Tu aides l'utilisateur dans ses demandes générales et professionnelles.
 Réponds principalement en français, de façon claire, naturelle et utile.
-Lorsque la question concerne Arrow Home Group ou Forza Luxury :
-- distingue toujours les deux entreprises ;
-- utilise uniquement les informations présentes dans la base de connaissances fournie ;
-- n'invente jamais de services, prix, coordonnées, réalisations ou liens ;
-- si une information manque ou n'est pas confirmée, dis-le clairement.
-Pour toute autre demande, réponds normalement. Ne prétends pas avoir vérifié des informations récentes si tu ne l'as pas fait.
+Pour Arrow Home Group et Forza Luxury, distingue les deux entreprises et utilise
+uniquement les informations fournies par la base de connaissances. N'invente pas
+de services, prix, coordonnées, réalisations ou liens. Si une information manque,
+dis-le clairement. Pour les autres demandes, réponds normalement.
+Ne prétends pas avoir vérifié des informations récentes si tu ne l'as pas fait.
 """
 
 def load_knowledge():
-    """Récupère les connaissances depuis Supabase. Retourne un message explicite si indisponible."""
     if not SUPABASE_URL or not SUPABASE_KEY:
-        return [], "Supabase n'est pas configuré : la réponse utilisera les connaissances générales seulement."
+        return [], "Supabase n'est pas configuré : les réponses utiliseront les connaissances générales."
     url = f"{SUPABASE_URL}/rest/v1/ayzora_knowledge"
-    params = {
-        "select": "company,category,title,content,verified,updated_at",
-        "order": "updated_at.desc",
-    }
-    headers = {"apikey": SUPABASE_KEY}
+    params = {"select": "company,category,title,content,verified,updated_at", "order": "updated_at.desc"}
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
     try:
         response = requests.get(url, headers=headers, params=params, timeout=15)
         response.raise_for_status()
-        data = response.json()
-        return data, ""
+        return response.json(), ""
     except Exception as exc:
         return [], f"Base de connaissances Supabase indisponible ({type(exc).__name__})."
 
 def extract_text_file(path):
     path = Path(path)
     ext = path.suffix.lower()
-
     if ext == ".pdf":
         reader = PdfReader(str(path))
         return "\n".join(page.extract_text() or "" for page in reader.pages)
-
     if ext == ".docx":
         doc = Document(str(path))
         chunks = [p.text for p in doc.paragraphs if p.text.strip()]
@@ -70,14 +59,11 @@ def extract_text_file(path):
             for row in table.rows:
                 chunks.append(" | ".join(cell.text for cell in row.cells))
         return "\n".join(chunks)
-
     if ext == ".txt":
         return path.read_text(encoding="utf-8", errors="replace")
-
     if ext == ".csv":
         with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as f:
             return "\n".join(" | ".join(row) for row in csv.reader(f))
-
     if ext == ".xlsx":
         wb = load_workbook(path, read_only=True, data_only=True)
         chunks = []
@@ -89,33 +75,22 @@ def extract_text_file(path):
                     chunks.append(" | ".join(values))
         wb.close()
         return "\n".join(chunks)
-
     return ""
 
 def prepare_attachments(files):
-    """Prépare les pièces jointes : images envoyées à Gemini, documents convertis en texte."""
-    parts = []
-    notes = []
+    parts, notes = [], []
     max_chars_per_file = 25000
-
     for item in files or []:
         path = getattr(item, "name", None) or str(item)
         file_path = Path(path)
         if not file_path.exists():
             notes.append(f"Fichier ignoré (introuvable) : {file_path.name}")
             continue
-
         ext = file_path.suffix.lower()
         try:
             if ext in {".png", ".jpg", ".jpeg", ".webp"}:
-                mime = {
-                    ".png": "image/png",
-                    ".jpg": "image/jpeg",
-                    ".jpeg": "image/jpeg",
-                    ".webp": "image/webp",
-                }[ext]
-                data = file_path.read_bytes()
-                parts.append(types.Part.from_bytes(data=data, mime_type=mime))
+                mime = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}[ext]
+                parts.append(types.Part.from_bytes(data=file_path.read_bytes(), mime_type=mime))
                 notes.append(f"Image jointe : {file_path.name}")
             elif ext in {".pdf", ".docx", ".txt", ".csv", ".xlsx"}:
                 extracted = extract_text_file(file_path)
@@ -127,20 +102,19 @@ def prepare_attachments(files):
                 notes.append(f"Format non pris en charge : {file_path.name}")
         except Exception as exc:
             notes.append(f"Erreur de lecture pour {file_path.name} ({type(exc).__name__}).")
-
     return parts, notes
 
 def format_history(history):
-    """Convertit l'historique interne au format attendu par le prompt."""
     lines = []
     for item in (history or [])[-12:]:
         role = item.get("role", "")
-        text = item.get("text", "")
-        if text:
-            lines.append(f"{role}: {text}")
+        content = item.get("content", "")
+        if content:
+            lines.append(f"{role}: {content}")
     return "\n".join(lines) or "Début de conversation."
 
 async def respond(message, files, history):
+    # Format cohérent avec Chatbot(type="messages") : role + content.
     history = list(history or [])
     if not message or not message.strip():
         return history, history, "", None
@@ -164,14 +138,13 @@ MESSAGE ACTUEL :
 
 RÈGLES :
 - Réponds à la demande actuelle en tenant compte de l'historique.
-- Si des fichiers sont joints, analyse-les et base-toi sur leur contenu.
-- Ne prétends pas qu'un fichier ou une image contient des éléments que tu n'as pas pu lire.
+- Si des fichiers sont joints, analyse-les à partir du contenu fourni.
+- Ne prétends pas avoir lu un fichier ou une image si tu n'as pas pu les traiter.
 - Ne révèle jamais de clés, variables d'environnement ou détails secrets.
 """
     parts = [types.Part(text=prompt)] + attachment_parts
-
     try:
-        result = await __import__("asyncio").to_thread(
+        result = await asyncio.to_thread(
             client.models.generate_content,
             model=MODEL_NAME,
             contents=[types.Content(role="user", parts=parts)],
@@ -180,31 +153,23 @@ RÈGLES :
         if attachment_notes:
             answer += "\n\n---\n" + "\n".join(attachment_notes)
         if knowledge_warning:
-            answer += "\n\nNote technique : " + knowledge_warning
-
-        history.extend([
-            {"role": "user", "text": message},
-            {"role": "assistant", "text": answer},
-        ])
-        display = [{"role": item["role"], "content": item["text"]} for item in history]
-        return display, history, "", None
+            answer += "\n\nNote : " + knowledge_warning
     except Exception as exc:
-        safe_error = f"AYZORA n'a pas pu traiter la demande ({type(exc).__name__}). Vérifie la configuration et les journaux du service."
-        history.append({"role": "user", "text": message})
-        history.append({"role": "assistant", "text": safe_error})
-        display = [{"role": item["role"], "content": item["text"]} for item in history]
-        return display, history, "", None
+        answer = f"Je n'ai pas pu traiter cette demande ({type(exc).__name__}). Vérifie les journaux de Render."
+
+    history.extend([
+        {"role": "user", "content": message},
+        {"role": "assistant", "content": answer},
+    ])
+    return history, history, "", None
 
 def clear_chat():
     return [], [], None, ""
 
 with gr.Blocks(title=APP_TITLE, theme=gr.themes.Soft()) as demo:
-    gr.Markdown(
-        "# 🟠 AYZORA AI\n"
-        "Votre assistant intelligent — conversation, analyse de documents et d'images."
-    )
+    gr.Markdown("# 🟠 AYZORA AI\nVotre assistant intelligent — conversation, analyse de documents et d'images.")
     history_state = gr.State([])
-    chat = gr.Chatbot(label="Conversation", height=520)
+    chat = gr.Chatbot(label="Conversation", type="messages", height=520)
     attachments = gr.File(
         label="Joindre des images ou documents",
         file_count="multiple",
@@ -212,23 +177,13 @@ with gr.Blocks(title=APP_TITLE, theme=gr.themes.Soft()) as demo:
         file_types=[".png", ".jpg", ".jpeg", ".webp", ".pdf", ".docx", ".txt", ".csv", ".xlsx"],
     )
     with gr.Row():
-        textbox = gr.Textbox(
-            label="Message",
-            placeholder="Écrivez votre message à AYZORA...",
-            lines=2,
-            scale=6,
-        )
+        textbox = gr.Textbox(label="Message", placeholder="Écrivez votre message à AYZORA...", lines=2, scale=6)
         send = gr.Button("Envoyer", variant="primary", scale=1)
         clear = gr.Button("Nouvelle conversation", scale=1)
 
-    send.click(respond, inputs=[textbox, attachments, history_state],
-               outputs=[chat, history_state, textbox, attachments])
-    textbox.submit(respond, inputs=[textbox, attachments, history_state],
-                   outputs=[chat, history_state, textbox, attachments])
+    send.click(respond, inputs=[textbox, attachments, history_state], outputs=[chat, history_state, textbox, attachments])
+    textbox.submit(respond, inputs=[textbox, attachments, history_state], outputs=[chat, history_state, textbox, attachments])
     clear.click(clear_chat, outputs=[chat, history_state, attachments, textbox])
 
 if __name__ == "__main__":
-    demo.queue().launch(
-        server_name="0.0.0.0",
-        server_port=int(os.getenv("PORT", "10000")),
-    )
+    demo.queue().launch(server_name="0.0.0.0", server_port=int(os.getenv("PORT", "10000")))
