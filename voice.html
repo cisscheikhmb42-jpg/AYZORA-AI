@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+  <title>AYZORA AI — Mode vocal</title>
+
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: Arial, sans-serif;
+      background: #101114;
+      color: #ffffff;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      padding: 20px;
+    }
+
+    .container {
+      width: 100%;
+      max-width: 600px;
+      text-align: center;
+    }
+
+    .logo {
+      color: #ff9d36;
+      font-size: 34px;
+      font-weight: bold;
+      margin-bottom: 8px;
+    }
+
+    .subtitle {
+      color: #b7b7bd;
+      margin-bottom: 35px;
+    }
+
+    .orb {
+      width: 180px;
+      height: 180px;
+      margin: 0 auto 30px;
+      border-radius: 50%;
+      background: radial-gradient(
+        circle at 35% 30%,
+        #ffc477,
+        #ff8a24 40%,
+        #9c3dff 75%,
+        #28205c
+      );
+      box-shadow: 0 0 60px #ff922455;
+      transition: transform 0.3s ease;
+    }
+
+    .orb.active {
+      animation: pulse 1.5s infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% {
+        transform: scale(1);
+      }
+      50% {
+        transform: scale(1.08);
+      }
+    }
+
+    #status {
+      color: #d0d0d5;
+      min-height: 24px;
+      margin-bottom: 20px;
+    }
+
+    #transcript {
+      min-height: 70px;
+      padding: 18px;
+      background: #1b1c21;
+      border: 1px solid #303138;
+      border-radius: 14px;
+      line-height: 1.6;
+      overflow-wrap: anywhere;
+      margin-bottom: 25px;
+    }
+
+    button {
+      border: none;
+      border-radius: 30px;
+      padding: 15px 25px;
+      font-size: 16px;
+      font-weight: bold;
+      cursor: pointer;
+      margin: 5px;
+    }
+
+    #start {
+      background: #ff9d36;
+      color: #151515;
+    }
+
+    #stop {
+      background: #303138;
+      color: white;
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .notice {
+      margin-top: 25px;
+      color: #a8a8b0;
+      font-size: 13px;
+      line-height: 1.6;
+    }
+  </style>
+</head>
+
+<body>
+  <main class="container">
+
+    <div class="logo">AYZORA AI</div>
+
+    <div class="subtitle">
+      Ton assistant intelligent
+    </div>
+
+    <div id="orb" class="orb"></div>
+
+    <div id="status">
+      Prêt à démarrer
+    </div>
+
+    <div id="transcript">
+      Appuie sur « Commencer » pour tester le microphone.
+    </div>
+
+    <button id="start">
+      🎙️ Commencer
+    </button>
+
+    <button id="stop" disabled>
+      ⏹ Arrêter
+    </button>
+
+    <div class="notice">
+      Première étape : test du microphone et de la voix du navigateur.
+      La connexion à Gemini Live sera ajoutée ensuite.
+    </div>
+
+  </main>
+
+  <script>
+    const startButton = document.getElementById("start");
+    const stopButton = document.getElementById("stop");
+    const status = document.getElementById("status");
+    const transcript = document.getElementById("transcript");
+    const orb = document.getElementById("orb");
+
+    const SpeechRecognition =
+      window.SpeechRecognition ||
+      window.webkitSpeechRecognition;
+
+    let recognition;
+    let listening = false;
+
+    function speak(text) {
+      if (!("speechSynthesis" in window)) {
+        status.textContent =
+          "La synthèse vocale n'est pas disponible dans ce navigateur.";
+        return;
+      }
+
+      window.speechSynthesis.cancel();
+
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = "fr-FR";
+      utterance.rate = 1;
+
+      window.speechSynthesis.speak(utterance);
+    }
+
+    startButton.addEventListener("click", () => {
+      if (!SpeechRecognition) {
+        status.textContent =
+          "Utilise Google Chrome pour tester cette fonctionnalité.";
+        return;
+      }
+
+      if (listening) return;
+
+      recognition = new SpeechRecognition();
+      recognition.lang = "fr-FR";
+      recognition.continuous = true;
+      recognition.interimResults = true;
+
+      recognition.onstart = () => {
+        listening = true;
+        startButton.disabled = true;
+        stopButton.disabled = false;
+        orb.classList.add("active");
+        status.textContent = "Microphone activé : parle maintenant.";
+        transcript.textContent = "";
+      };
+
+      recognition.onresult = (event) => {
+        let text = "";
+
+        for (
+          let i = event.resultIndex;
+          i < event.results.length;
+          i++
+        ) {
+          text += event.results[i][0].transcript + " ";
+        }
+
+        transcript.textContent = text.trim();
+      };
+
+      recognition.onerror = (event) => {
+        status.textContent =
+          "Erreur du microphone : " + event.error;
+      };
+
+      recognition.onend = () => {
+        if (listening) {
+          try {
+            recognition.start();
+          } catch (error) {
+            console.log(error);
+          }
+        }
+      };
+
+      try {
+        recognition.start();
+      } catch (error) {
+        status.textContent =
+          "Impossible de démarrer le microphone.";
+      }
+    });
+
+    stopButton.addEventListener("click", () => {
+      listening = false;
+
+      if (recognition) {
+        recognition.stop();
+      }
+
+      window.speechSynthesis.cancel();
+
+      orb.classList.remove("active");
+      startButton.disabled = false;
+      stopButton.disabled = true;
+      status.textContent = "Microphone arrêté.";
+    });
+  </script>
+
+</body>
+</html>
