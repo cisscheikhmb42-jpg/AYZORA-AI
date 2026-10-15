@@ -495,15 +495,16 @@ def chat(message, history):
             "Essaie de reformuler ta question."
         )
 
-    except Exception as exc:
-        print(f"Erreur AYZORA AI : {exc}")
+        except Exception as exc:
+        import traceback
+
+        print("ERREUR AYZORA AI :", repr(exc))
+        traceback.print_exc()
 
         return (
-            "Une erreur est survenue pendant le traitement "
-            "de ta demande. Vérifie la configuration Gemini "
-            "et les journaux de Render, puis réessaie."
+            "Erreur Gemini : "
+            f"{type(exc).__name__}: {str(exc)}"
         )
-
 
 # =========================================================
 # 8. INTERFACE UTILISATEUR
