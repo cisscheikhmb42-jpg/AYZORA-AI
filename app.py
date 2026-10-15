@@ -495,7 +495,7 @@ def chat(message, history):
             "Essaie de reformuler ta question."
         )
 
-        except Exception as exc:
+    except Exception as exc:
         import traceback
 
         print("ERREUR AYZORA AI :", repr(exc))
@@ -505,7 +505,6 @@ def chat(message, history):
             "Erreur Gemini : "
             f"{type(exc).__name__}: {str(exc)}"
         )
-
 # =========================================================
 # 8. INTERFACE UTILISATEUR
 # =========================================================
