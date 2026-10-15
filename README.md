@@ -1,22 +1,24 @@
 # 🟠 AYZORA AI
 
-AYZORA AI est un assistant intelligent utilisant
-Google Gemini pour répondre aux questions,
-analyser des documents et comprendre des images.
+### Ton assistant intelligent propulsé par Google Gemini
 
-## Fonctionnalités
+AYZORA AI est un assistant intelligent conçu pour répondre aux questions,
+analyser des documents et comprendre des images grâce à l'intelligence artificielle.
+
+## 🚀 Fonctionnalités
 
 - Chatbot basé sur Google Gemini.
-- Conversations avec historique pendant la session.
+- Historique des conversations pendant la session.
 - Analyse de documents PDF.
-- Lecture de documents Word.
-- Lecture de fichiers Excel et CSV.
+- Lecture de documents Word (DOCX).
+- Lecture de fichiers Excel (XLSX et XLSM).
+- Analyse de fichiers CSV.
 - Lecture de fichiers TXT, Markdown, JSON et LOG.
 - Analyse d'images PNG, JPG, JPEG et WEBP.
-- Connexion optionnelle à une base de connaissances Supabase.
+- Connexion optionnelle à Supabase.
 - Interface web avec Gradio.
 
-## Technologies
+## 🛠️ Technologies
 
 - Python
 - Gradio 5
@@ -24,9 +26,10 @@ analyser des documents et comprendre des images.
 - Supabase REST API
 - Render
 
-## Installation
+## ⚙️ Installation
 
-Installer les dépendances :
+### 1. Cloner le dépôt
 
 ```bash
-pip install -r requirements.txt
+git clone https://github.com/cisscheikhmb42-jpg/AYZORA-AI.git
+cd AYZORA-AI
