@@ -1,15 +1,22 @@
-# AYZORA AI
+# AYZORA AI — version corrigée
 
-Assistant basé sur Gemini, avec récupération optionnelle des connaissances depuis Supabase et lecture de documents/images.
+## Fichiers
+- `app.py` : chatbot Gemini et lecture de documents.
+- `requirements.txt` : dépendances compatibles avec Gradio 5 et `type="messages"`.
 
-## Variables d'environnement Render
-- `GEMINI_API_KEY` (obligatoire)
-- `GEMINI_MODEL` (facultatif ; valeur par défaut `gemini-3.1-flash-lite-preview`)
-- `SUPABASE_URL` (facultatif)
-- `SUPABASE_PUBLISHABLE_KEY` ou `SUPABASE_ANON_KEY` (facultatif)
+## Configuration Render
+Dans Render → service AYZORA AI → Environment, configure :
+- `GEMINI_API_KEY` : ta clé API Google AI Studio.
+- `GEMINI_MODEL` (facultatif) : modèle Gemini à utiliser. Par défaut : `gemini-2.5-flash`.
 
-## Commandes Render
-Build: `pip install -r requirements.txt`
-Start: `python app.py`
+Ne publie jamais ta clé API dans GitHub et ne l'écris pas directement dans `app.py`.
 
-L'historique est conservé dans l'état de la session Gradio ; il n'est pas encore stocké durablement dans Supabase.
+## Déploiement
+1. Remplace le contenu de `app.py` par le fichier fourni.
+2. Remplace le contenu de `requirements.txt` par le fichier fourni.
+3. Enregistre les deux fichiers sur GitHub avec **Commit changes**.
+4. Dans Render, lance **Manual Deploy → Deploy latest commit** si nécessaire.
+5. Vérifie les logs de build et de démarrage.
+
+## Attention
+Cette version gère les documents joints à une conversation, mais ne réintègre pas automatiquement une éventuelle base de connaissances Supabase de l'ancienne application. Si AYZORA AI dépend de Supabase pour ses connaissances, cette intégration devra être rétablie selon le schéma exact de la base avant de considérer la migration comme complète.
