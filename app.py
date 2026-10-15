@@ -1,154 +1,209 @@
 import os
-import json
 import csv
-import io
-import base64
+import json
+import mimetypes
 from pathlib import Path
 
 import gradio as gr
 import requests
+
 from google import genai
 from google.genai import types
-from pypdf import PdfReader
-from docx import Document
-from openpyxl import load_workbook
 
 
-# ==========================================
-# CONFIGURATION AYZORA AI
-# ==========================================
+# =========================================================
+# 1. CONFIGURATION AYZORA AI
+# =========================================================
 
 APP_NAME = "AYZORA AI"
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-SUPPORTED_IMAGES = {
-    ".png", ".jpg", ".jpeg", ".webp"
-}
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv(
+    "GEMINI_MODEL",
+    "gemini-2.5-flash"
+).strip()
 
-SUPPORTED_DOCUMENTS = {
-    ".pdf", ".docx", ".txt", ".md",
-    ".json", ".log", ".csv", ".xlsx", ".xlsm"
-}
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "").strip()
 
+MAX_FILE_SIZE = 15 * 1024 * 1024
+MAX_TEXT_CHARS = 30000
 
-# ==========================================
-# CONNEXION GEMINI
-# ==========================================
+client = None
 
-def get_gemini_client():
-    api_key = (
-        os.getenv("GEMINI_API_KEY")
-        or os.getenv("GOOGLE_API_KEY")
-    )
-
-    if not api_key:
-        raise ValueError(
-            "La clé API Gemini est absente. "
-            "Configure GEMINI_API_KEY dans Render."
-        )
-
-    return genai.Client(api_key=api_key)
+if GEMINI_API_KEY:
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+    except Exception as exc:
+        print(f"Erreur d'initialisation Gemini : {exc}")
 
 
-# ==========================================
-# CONNAISSANCES SUPABASE (OPTIONNEL)
-# ==========================================
+# =========================================================
+# 2. INSTRUCTIONS DE L'ASSISTANT
+# =========================================================
+
+SYSTEM_INSTRUCTION = """
+Tu es AYZORA AI, un assistant intelligent polyvalent.
+
+OBJECTIFS :
+- Répondre clairement, précisément et utilement.
+- Comprendre les besoins de l'utilisateur.
+- Aider à analyser des documents et des images.
+- Aider à rédiger, apprendre, programmer et résoudre des problèmes.
+- Proposer des solutions concrètes et structurées.
+- Répondre en français lorsque l'utilisateur écrit en français.
+
+CONTEXTE PROFESSIONNEL :
+L'utilisateur peut travailler sur Arrow Home Group et Forza Luxury.
+Ne confonds jamais ces deux entreprises.
+N'invente pas leurs prix, coordonnées, services ou informations internes.
+Utilise les informations disponibles dans les documents fournis
+et dans la base de connaissances lorsqu'elles sont pertinentes.
+
+RÈGLES :
+- Si une information manque, explique-le honnêtement.
+- Ne prétends pas avoir effectué une action que tu n'as pas réalisée.
+- Pour le code informatique, fournis des exemples cohérents.
+- Pour les documents et les images, analyse réellement leur contenu
+  lorsqu'il est disponible.
+- Sois professionnel, pédagogique et orienté vers les résultats.
+"""
+
+
+# =========================================================
+# 3. BASE DE CONNAISSANCES SUPABASE
+# =========================================================
 
 def load_knowledge(question):
-    supabase_url = os.getenv("SUPABASE_URL")
-    supabase_key = (
-        os.getenv("SUPABASE_PUBLISHABLE_KEY")
-        or os.getenv("SUPABASE_ANON_KEY")
-    )
+    """
+    Récupère des informations depuis la table ayzora_knowledge.
 
-    if not supabase_url or not supabase_key:
+    Variables nécessaires :
+    SUPABASE_URL
+    SUPABASE_ANON_KEY
+
+    Colonnes attendues :
+    id, title, content, verified
+    """
+
+    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
         return ""
 
+    endpoint = (
+        f"{SUPABASE_URL}/rest/v1/ayzora_knowledge"
+    )
+
+    headers = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    params = {
+        "select": "title,content",
+        "verified": "eq.true",
+        "limit": "8",
+    }
+
     try:
-        url = (
-            f"{supabase_url.rstrip('/')}"
-            "/rest/v1/ayzora_knowledge"
-        )
-
-        headers = {
-            "apikey": supabase_key,
-            "Authorization": f"Bearer {supabase_key}",
-        }
-
-        params = {
-            "select": "company,category,title,content",
-            "verified": "eq.true",
-            "limit": "10",
-        }
-
         response = requests.get(
-            url,
+            endpoint,
             headers=headers,
             params=params,
-            timeout=15,
+            timeout=10,
         )
 
         response.raise_for_status()
-        rows = response.json()
+        records = response.json()
 
-        if not rows:
+        if not isinstance(records, list):
             return ""
 
-        knowledge = []
+        sections = []
 
-        for row in rows:
-            title = row.get("title", "")
-            content = row.get("content", "")
-            category = row.get("category", "")
-            company = row.get("company", "")
+        for record in records:
+            title = str(record.get("title") or "").strip()
+            content = str(record.get("content") or "").strip()
 
             if content:
-                knowledge.append(
-                    f"Entreprise : {company}\n"
-                    f"Catégorie : {category}\n"
+                sections.append(
                     f"Titre : {title}\n"
-                    f"Contenu : {content}"
+                    f"Contenu : {content[:4000]}"
                 )
 
-        return "\n\n".join(knowledge)
+        return "\n\n".join(sections)[:MAX_TEXT_CHARS]
 
-    except Exception as error:
-        print(f"Erreur Supabase : {error}")
+    except Exception as exc:
+        print(f"Supabase indisponible : {exc}")
         return ""
 
 
-# ==========================================
-# EXTRACTION DES DOCUMENTS
-# ==========================================
+# =========================================================
+# 4. EXTRACTION DU TEXTE DES DOCUMENTS
+# =========================================================
 
-def extract_text_file(file_path):
+def extract_document_text(file_path):
+    """
+    Extrait le texte des fichiers PDF, DOCX, TXT, MD,
+    JSON, CSV et XLSX.
+    """
+
     path = Path(file_path)
     extension = path.suffix.lower()
 
+    if not path.exists():
+        return "[Fichier introuvable]"
+
+    if path.stat().st_size > MAX_FILE_SIZE:
+        return (
+            f"[Le fichier {path.name} dépasse la limite "
+            "de 15 Mo.]"
+        )
+
     try:
         if extension == ".pdf":
+            from pypdf import PdfReader
+
             reader = PdfReader(str(path))
             pages = []
 
-            for page in reader.pages:
+            for page in reader.pages[:40]:
                 pages.append(page.extract_text() or "")
 
-            return "\n".join(pages)
+            return "\n".join(pages)[:MAX_TEXT_CHARS]
 
         if extension == ".docx":
+            from docx import Document
+
             document = Document(str(path))
-            return "\n".join(
+
+            paragraphs = [
                 paragraph.text
                 for paragraph in document.paragraphs
-            )
+                if paragraph.text.strip()
+            ]
 
-        if extension in {
-            ".txt", ".md", ".json", ".log"
-        }:
+            return "\n".join(paragraphs)[:MAX_TEXT_CHARS]
+
+        if extension in {".txt", ".md", ".log"}:
             return path.read_text(
                 encoding="utf-8",
                 errors="replace",
-            )
+            )[:MAX_TEXT_CHARS]
+
+        if extension == ".json":
+            with path.open(
+                "r",
+                encoding="utf-8",
+                errors="replace",
+            ) as file:
+                data = json.load(file)
+
+            return json.dumps(
+                data,
+                ensure_ascii=False,
+                indent=2,
+            )[:MAX_TEXT_CHARS]
 
         if extension == ".csv":
             with path.open(
@@ -157,110 +212,139 @@ def extract_text_file(file_path):
                 errors="replace",
                 newline="",
             ) as file:
-                return file.read()
+                rows = list(csv.reader(file))
+
+            return "\n".join(
+                " | ".join(row) for row in rows[:300]
+            )[:MAX_TEXT_CHARS]
 
         if extension in {".xlsx", ".xlsm"}:
+            from openpyxl import load_workbook
+
             workbook = load_workbook(
-                filename=str(path),
+                str(path),
                 read_only=True,
                 data_only=True,
             )
 
-            output = []
+            sections = []
 
-            for sheet in workbook.worksheets:
-                output.append(
-                    f"\nFeuille : {sheet.title}"
-                )
+            try:
+                for sheet in workbook.worksheets:
+                    sections.append(
+                        f"\nFeuille : {sheet.title}"
+                    )
 
-                for row in sheet.iter_rows(
-                    values_only=True
-                ):
-                    values = [
-                        str(value) if value is not None else ""
-                        for value in row
-                    ]
+                    for row in sheet.iter_rows(
+                        min_row=1,
+                        max_row=150,
+                        values_only=True,
+                    ):
+                        values = [
+                            str(value)
+                            if value is not None
+                            else ""
+                            for value in row
+                        ]
 
-                    output.append(" | ".join(values))
+                        sections.append(" | ".join(values))
 
-            workbook.close()
-            return "\n".join(output)
+                        if sum(map(len, sections)) > MAX_TEXT_CHARS:
+                            break
+
+                    if sum(map(len, sections)) > MAX_TEXT_CHARS:
+                        break
+
+            finally:
+                workbook.close()
+
+            return "\n".join(sections)[:MAX_TEXT_CHARS]
 
         return (
-            f"Le format {extension} n'est pas pris en charge."
+            f"[Le format {extension} n'est pas pris en charge "
+            "pour l'extraction de texte.]"
         )
 
-    except Exception as error:
-        return f"Erreur de lecture du fichier : {error}"
+    except Exception as exc:
+        print(f"Erreur de lecture du fichier {path.name} : {exc}")
+        return f"[Impossible de lire le fichier {path.name}.]"
 
 
-# ==========================================
-# PRÉPARATION DES PIÈCES JOINTES
-# ==========================================
+# =========================================================
+# 5. PRÉPARATION DES FICHIERS POUR GEMINI
+# =========================================================
 
-def prepare_attachments(files):
+def prepare_file_parts(file_paths):
+    """
+    Prépare les documents et images pour Gemini.
+    """
+
     parts = []
 
-    if not files:
+    if not file_paths:
         return parts
 
-    for file_path in files:
+    for file_path in file_paths:
         if not file_path:
             continue
 
         path = Path(file_path)
+
+        if not path.exists():
+            parts.append(
+                types.Part.from_text(
+                    text=f"Fichier introuvable : {path.name}"
+                )
+            )
+            continue
+
+        if path.stat().st_size > MAX_FILE_SIZE:
+            parts.append(
+                types.Part.from_text(
+                    text=f"Fichier trop volumineux : {path.name}"
+                )
+            )
+            continue
+
         extension = path.suffix.lower()
 
-        if extension in SUPPORTED_IMAGES:
-            try:
-                mime_types = {
-                    ".png": "image/png",
-                    ".jpg": "image/jpeg",
-                    ".jpeg": "image/jpeg",
-                    ".webp": "image/webp",
-                }
+        image_extensions = {
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".webp",
+        }
 
-                image_bytes = path.read_bytes()
+        if extension in image_extensions:
+            mime_type, _ = mimetypes.guess_type(str(path))
 
-                parts.append(
-                    types.Part.from_bytes(
-                        data=image_bytes,
-                        mime_type=mime_types[extension],
-                    )
-                )
+            if not mime_type:
+                mime_type = "image/jpeg"
 
-            except Exception as error:
-                parts.append(
-                    types.Part.from_text(
-                        text=(
-                            f"Impossible de lire l'image "
-                            f"{path.name} : {error}"
-                        )
-                    )
-                )
-
-        elif extension in SUPPORTED_DOCUMENTS:
-            text_content = extract_text_file(path)
-
-            # Limite de sécurité pour éviter
-            # d'envoyer des documents trop volumineux.
-            text_content = text_content[:50000]
+            with path.open("rb") as file:
+                image_bytes = file.read()
 
             parts.append(
                 types.Part.from_text(
-                    text=(
-                        f"\nDOCUMENT : {path.name}\n"
-                        f"{text_content}"
-                    )
+                    text=f"Image fournie : {path.name}"
+                )
+            )
+
+            parts.append(
+                types.Part.from_bytes(
+                    data=image_bytes,
+                    mime_type=mime_type,
                 )
             )
 
         else:
+            extracted_text = extract_document_text(path)
+
             parts.append(
                 types.Part.from_text(
                     text=(
-                        f"Le fichier {path.name} "
-                        "n'est pas pris en charge."
+                        f"Document : {path.name}\n"
+                        f"Contenu extrait :\n{extracted_text}"
                     )
                 )
             )
@@ -268,17 +352,18 @@ def prepare_attachments(files):
     return parts
 
 
-# ==========================================
-# HISTORIQUE DE CONVERSATION
-# ==========================================
+# =========================================================
+# 6. CONSTRUCTION DE L'HISTORIQUE
+# =========================================================
 
-def format_history(history):
-    formatted = []
+def build_contents(message, history, file_paths):
+    """
+    Construit les messages envoyés à Gemini.
+    """
 
-    if not history:
-        return formatted
+    contents = []
 
-    for item in history[-12:]:
+    for item in (history or [])[-12:]:
         if not isinstance(item, dict):
             continue
 
@@ -288,244 +373,220 @@ def format_history(history):
         if role not in {"user", "assistant"}:
             continue
 
-        if isinstance(content, str) and content.strip():
-            formatted.append(
-                types.Content(
-                    role="model" if role == "assistant" else "user",
-                    parts=[
-                        types.Part.from_text(text=content)
-                    ],
-                )
-            )
+        if not isinstance(content, str) or not content.strip():
+            continue
 
-    return formatted
-
-
-# ==========================================
-# CONSTRUCTION DU PROMPT
-# ==========================================
-
-def build_prompt(message, knowledge):
-    prompt = f"""
-Tu es {APP_NAME}, un assistant IA intelligent,
-professionnel, fiable et utile.
-
-Tes objectifs :
-- Répondre clairement aux questions.
-- Expliquer les sujets complexes simplement.
-- Aider à rédiger, analyser et organiser des informations.
-- Aider à la création de contenus et à la résolution de problèmes.
-- Analyser les documents et les images fournis.
-- Répondre en français si l'utilisateur écrit en français.
-
-Règles importantes :
-- N'invente pas des informations présentées comme certaines.
-- Si tu ne connais pas une réponse, indique-le honnêtement.
-- Respecte les instructions de l'utilisateur lorsqu'elles sont sûres.
-- Utilise les documents joints lorsqu'ils sont pertinents.
-- Distingue les faits des hypothèses.
-
-"""
-
-    if knowledge:
-        prompt += f"""
-CONNAISSANCES DISPONIBLES :
-
-{knowledge}
-
-Utilise ces informations uniquement lorsqu'elles sont pertinentes.
-"""
-
-    prompt += f"""
-
-QUESTION DE L'UTILISATEUR :
-
-{message}
-"""
-
-    return prompt
-
-
-# ==========================================
-# RÉPONSE DE L'ASSISTANT
-# ==========================================
-
-def respond(message, history, files):
-    if not message and not files:
-        return "Écris une question ou ajoute un fichier."
-
-    try:
-        client = get_gemini_client()
-
-        question = message or (
-            "Analyse les fichiers joints et explique leur contenu."
-        )
-
-        knowledge = load_knowledge(question)
-        prompt = build_prompt(question, knowledge)
-
-        contents = format_history(history)
-
-        user_parts = [
-            types.Part.from_text(text=prompt)
-        ]
-
-        user_parts.extend(
-            prepare_attachments(files)
-        )
+        gemini_role = "user" if role == "user" else "model"
 
         contents.append(
             types.Content(
-                role="user",
-                parts=user_parts,
+                role=gemini_role,
+                parts=[
+                    types.Part.from_text(text=content)
+                ],
             )
         )
 
+    question = (message or "").strip()
+
+    if not question and not file_paths:
+        question = (
+            "Bonjour, présente-toi et explique-moi "
+            "comment tu peux m'aider."
+        )
+
+    knowledge = load_knowledge(question)
+
+    prompt_parts = [
+        types.Part.from_text(
+            text=SYSTEM_INSTRUCTION
+        )
+    ]
+
+    if knowledge:
+        prompt_parts.append(
+            types.Part.from_text(
+                text=(
+                    "INFORMATIONS DE LA BASE DE CONNAISSANCES :\n"
+                    f"{knowledge}\n\n"
+                    "Utilise ces informations uniquement "
+                    "si elles sont pertinentes."
+                )
+            )
+        )
+
+    prompt_parts.append(
+        types.Part.from_text(
+            text=(
+                "MESSAGE DE L'UTILISATEUR :\n"
+                f"{question or 'Analyse les fichiers joints.'}"
+            )
+        )
+    )
+
+    prompt_parts.extend(
+        prepare_file_parts(file_paths)
+    )
+
+    contents.append(
+        types.Content(
+            role="user",
+            parts=prompt_parts,
+        )
+    )
+
+    return contents
+
+
+# =========================================================
+# 7. FONCTION PRINCIPALE DE L'ASSISTANT
+# =========================================================
+
+def chat(message, history):
+    """
+    Fonction appelée par l'interface Gradio.
+    """
+
+    if not client:
+        return (
+            "La clé GEMINI_API_KEY n'est pas configurée "
+            "ou l'initialisation de Gemini a échoué. "
+            "Ajoute ta clé dans les variables d'environnement "
+            "de Render, puis redémarre l'application."
+        )
+
+    if isinstance(message, dict):
+        question = str(message.get("text") or "").strip()
+        file_paths = message.get("files") or []
+    else:
+        question = str(message or "").strip()
+        file_paths = []
+
+    if isinstance(file_paths, str):
+        file_paths = [file_paths]
+
+    if not question and not file_paths:
+        return "Écris une question ou joins un fichier."
+
+    try:
+        contents = build_contents(
+            question,
+            history,
+            file_paths,
+        )
+
         response = client.models.generate_content(
-            model=MODEL_NAME,
+            model=GEMINI_MODEL,
             contents=contents,
             config=types.GenerateContentConfig(
-                temperature=0.5,
+                system_instruction=SYSTEM_INSTRUCTION,
+                temperature=0.4,
                 max_output_tokens=4096,
             ),
         )
 
         answer = response.text
 
-        if not answer:
-            answer = (
-                "Je n'ai pas pu générer de réponse. "
-                "Essaie de reformuler ta question."
-            )
+        if answer and answer.strip():
+            return answer.strip()
 
-        return answer
+        return (
+            "Je n'ai pas pu produire de réponse textuelle. "
+            "Essaie de reformuler ta question."
+        )
 
-    except Exception as error:
-        print(f"Erreur AYZORA AI : {error}")
+    except Exception as exc:
+        print(f"Erreur AYZORA AI : {exc}")
 
         return (
             "Une erreur est survenue pendant le traitement "
-            "de ta demande.\n\n"
-            f"Détail : {error}\n\n"
-            "Vérifie la clé API Gemini et les journaux "
-            "de déploiement sur Render."
+            "de ta demande. Vérifie la configuration Gemini "
+            "et les journaux de Render, puis réessaie."
         )
 
 
-# ==========================================
-# INTERFACE GRADIO
-# ==========================================
+# =========================================================
+# 8. INTERFACE UTILISATEUR
+# =========================================================
 
-with gr.Blocks(title=APP_NAME) as demo:
+DESCRIPTION = """
+### Bienvenue sur AYZORA AI
+
+Ton assistant intelligent pour :
+- Répondre à tes questions et t'aider à apprendre.
+- Rédiger des contenus et préparer des stratégies.
+- Analyser des images et des documents.
+- T'accompagner dans tes projets professionnels et techniques.
+
+**Comment commencer ?**
+
+Écris ta question dans la zone de discussion.
+Tu peux également joindre un document ou une image.
+"""
+
+with gr.Blocks(
+    theme=gr.themes.Soft(),
+    title="AYZORA AI",
+) as demo:
+
     gr.Markdown(
-        f"""
-        # 🟠 {APP_NAME}
-
-        **Ton assistant intelligent propulsé par Google Gemini.**
-
-        Pose une question, ajoute un document ou envoie une image.
-        """
+        "# 🟠 AYZORA AI\n"
+        "### Ton assistant intelligent"
     )
 
-    chatbot = gr.Chatbot(
-        label="Conversation",
+    gr.Markdown(DESCRIPTION)
+
+    gr.ChatInterface(
+        fn=chat,
         type="messages",
-        height=520,
-    )
-
-    message = gr.Textbox(
-        label="Ton message",
-        placeholder="Pose ta question à AYZORA AI...",
-        lines=3,
-    )
-
-    files = gr.File(
-        label="Ajouter des documents ou des images",
-        file_count="multiple",
-        type="filepath",
-        file_types=[
-            ".pdf",
-            ".docx",
-            ".txt",
-            ".md",
-            ".json",
-            ".log",
-            ".csv",
-            ".xlsx",
-            ".xlsm",
-            ".png",
-            ".jpg",
-            ".jpeg",
-            ".webp",
+        multimodal=True,
+        chatbot=gr.Chatbot(
+            type="messages",
+            height=500,
+            placeholder="Pose ta première question à AYZORA AI...",
+        ),
+        textbox=gr.MultimodalTextbox(
+            placeholder=(
+                "Écris ta question ou joins un fichier..."
+            ),
+            file_count="multiple",
+            file_types=[
+                ".pdf",
+                ".docx",
+                ".txt",
+                ".md",
+                ".log",
+                ".json",
+                ".csv",
+                ".xlsx",
+                ".xlsm",
+                ".png",
+                ".jpg",
+                ".jpeg",
+                ".webp",
+            ],
+            sources=["upload"],
+        ),
+        examples=[
+            "Présente-toi et explique-moi tes capacités.",
+            "Aide-moi à préparer une stratégie marketing digital.",
+            "Explique-moi simplement ce qu'est un agent IA.",
         ],
+        save_history=True,
     )
 
-    with gr.Row():
-        send_button = gr.Button(
-            "Envoyer",
-            variant="primary",
-        )
-
-        clear_button = gr.Button("Effacer la conversation")
-
-    def user_message(user_text, current_history, uploaded_files):
-        if current_history is None:
-            current_history = []
-
-        if not user_text and not uploaded_files:
-            return current_history, ""
-
-        display_text = user_text or (
-            "Analyse les fichiers joints."
-        )
-
-        new_history = current_history + [
-            {
-                "role": "user",
-                "content": display_text,
-            }
-        ]
-
-        answer = respond(
-            user_text,
-            current_history,
-            uploaded_files,
-        )
-
-        new_history.append(
-            {
-                "role": "assistant",
-                "content": answer,
-            }
-        )
-
-        return new_history, ""
-
-    send_button.click(
-        fn=user_message,
-        inputs=[message, chatbot, files],
-        outputs=[chatbot, message],
-    )
-
-    message.submit(
-        fn=user_message,
-        inputs=[message, chatbot, files],
-        outputs=[chatbot, message],
-    )
-
-    clear_button.click(
-        fn=lambda: ([], ""),
-        inputs=[],
-        outputs=[chatbot, message],
+    gr.Markdown(
+        "---\n"
+        "AYZORA AI · Assistant intelligent"
     )
 
 
-# ==========================================
-# LANCEMENT
-# ==========================================
+# =========================================================
+# 9. DÉMARRAGE DE L'APPLICATION
+# =========================================================
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "7860"))
+    port = int(os.environ.get("PORT", "7860"))
 
     demo.launch(
         server_name="0.0.0.0",
