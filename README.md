@@ -1,22 +1,38 @@
-# AYZORA AI — version corrigée
+# AYZORA AI — version complète corrigée
 
-## Fichiers
-- `app.py` : chatbot Gemini et lecture de documents.
-- `requirements.txt` : dépendances compatibles avec Gradio 5 et `type="messages"`.
+Cette version contient :
+- Chatbot Gemini avec affichage des messages Gradio 5.
+- Historique de conversation conservé pendant la session.
+- Récupération optionnelle des connaissances depuis Supabase REST.
+- Analyse de fichiers PDF, DOCX, TXT, MD, JSON, LOG, CSV, XLSX et XLSM.
+- Analyse d'images PNG, JPG, JPEG et WEBP via Gemini.
 
-## Configuration Render
-Dans Render → service AYZORA AI → Environment, configure :
-- `GEMINI_API_KEY` : ta clé API Google AI Studio.
-- `GEMINI_MODEL` (facultatif) : modèle Gemini à utiliser. Par défaut : `gemini-2.5-flash`.
+## Variables d'environnement Render
 
-Ne publie jamais ta clé API dans GitHub et ne l'écris pas directement dans `app.py`.
+Obligatoire :
+- `GEMINI_API_KEY` : clé API Google AI Studio.
+
+Facultatives :
+- `GEMINI_MODEL` : modèle Gemini ; valeur par défaut `gemini-2.5-flash`.
+- `SUPABASE_URL` : URL du projet Supabase.
+- `SUPABASE_PUBLISHABLE_KEY` ou `SUPABASE_ANON_KEY` : clé publique/anon Supabase.
+
+La table Supabase attendue est `ayzora_knowledge`, avec les colonnes `company`, `category`,
+`title`, `content`, `verified` et `updated_at`. Si ton schéma est différent, adapte la requête
+`load_knowledge()` avant de déployer. Utilise uniquement une clé publique/anon côté application,
+jamais la clé `service_role`.
+
+## Commandes Render
+Build command : `pip install -r requirements.txt`
+Start command : `python app.py`
+
+Ne place jamais les clés API dans le code ou dans GitHub.
 
 ## Déploiement
-1. Remplace le contenu de `app.py` par le fichier fourni.
-2. Remplace le contenu de `requirements.txt` par le fichier fourni.
-3. Enregistre les deux fichiers sur GitHub avec **Commit changes**.
-4. Dans Render, lance **Manual Deploy → Deploy latest commit** si nécessaire.
-5. Vérifie les logs de build et de démarrage.
+1. Remplace entièrement `app.py` par le fichier fourni.
+2. Remplace entièrement `requirements.txt` par le fichier fourni.
+3. Fais un commit GitHub.
+4. Dans Render, lance `Manual Deploy` → `Deploy latest commit`.
+5. Consulte les Build Logs et Runtime Logs.
 
-## Attention
-Cette version gère les documents joints à une conversation, mais ne réintègre pas automatiquement une éventuelle base de connaissances Supabase de l'ancienne application. Si AYZORA AI dépend de Supabase pour ses connaissances, cette intégration devra être rétablie selon le schéma exact de la base avant de considérer la migration comme complète.
+Remarque : l'historique est conservé dans la session Gradio, pas de façon permanente dans Supabase.
