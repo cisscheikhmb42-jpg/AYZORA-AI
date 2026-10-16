@@ -1022,11 +1022,27 @@ with gr.Blocks(
                 session_state,
                 conversation_state,
             ],
-            examples=[
-                "Présente-toi et explique-moi tes capacités.",
-                "Aide-moi à préparer une stratégie marketing digital.",
-                "Explique-moi simplement ce qu'est un agent IA.",
-                "Je souhaite que tu retiennes que mon objectif est de développer AYZORA AI.",
+                        examples=[
+                [
+                    "Présente-toi et explique-moi tes capacités.",
+                    None,
+                    None,
+                ],
+                [
+                    "Aide-moi à préparer une stratégie marketing digital.",
+                    None,
+                    None,
+                ],
+                [
+                    "Explique-moi simplement ce qu'est un agent IA.",
+                    None,
+                    None,
+                ],
+                [
+                    "Je souhaite que tu retiennes que mon objectif est de développer AYZORA AI.",
+                    None,
+                    None,
+                ],
             ],
             save_history=False,
         )
