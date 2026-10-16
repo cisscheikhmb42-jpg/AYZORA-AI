@@ -2,7 +2,9 @@ import os
 import csv
 import json
 import mimetypes
+import time
 import uuid
+import traceback
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -19,10 +21,18 @@ from google.genai import types
 APP_NAME = "AYZORA AI"
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv(
-    "GEMINI_MODEL",
-    "gemini-3.5-flash-lite"
-).strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+
+FALLBACK_MODELS = [
+    model.strip()
+    for model in os.getenv(
+        "GEMINI_FALLBACK_MODELS",
+        "gemini-3.6-flash,gemini-3.5-flash-lite"
+    ).split(",")
+    if model.strip()
+]
+
+MODEL_CANDIDATES = list(dict.fromkeys([GEMINI_MODEL] + FALLBACK_MODELS))
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = (
@@ -33,6 +43,7 @@ SUPABASE_KEY = (
 MAX_FILE_SIZE = 15 * 1024 * 1024
 MAX_TEXT_CHARS = 30000
 REST_TIMEOUT = 15
+GEMINI_RETRIES = 2
 
 client = None
 
@@ -65,11 +76,11 @@ N'invente pas leurs prix, coordonnées, services ou informations internes.
 Utilise les informations disponibles dans les documents fournis,
 dans la mémoire persistante et dans la base de connaissances.
 
-MÉMOIRE :
-- Utilise les souvenirs enregistrés uniquement pour aider leur propriétaire.
+MÉMOIRE ET CONFIDENTIALITÉ :
+- Utilise uniquement les souvenirs du compte actuellement connecté.
+- Ne révèle jamais les souvenirs d'un autre utilisateur.
 - Ne prétends jamais avoir mémorisé une information si sa sauvegarde a échoué.
 - Si une information manque, demande une précision.
-- Ne révèle jamais les souvenirs d'un autre utilisateur.
 
 RÈGLES :
 - Si une information manque, explique-le honnêtement.
@@ -88,11 +99,9 @@ def supabase_headers(access_token=None, prefer=None):
     if not SUPABASE_KEY:
         return {}
 
-    token = access_token or SUPABASE_KEY
-
     headers = {
         "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {token}",
+        "Authorization": f"Bearer {access_token or SUPABASE_KEY}",
         "Content-Type": "application/json",
     }
 
@@ -102,8 +111,16 @@ def supabase_headers(access_token=None, prefer=None):
     return headers
 
 
-def supabase_request(method, table, access_token, params=None, payload=None, prefer=None):
+def supabase_request(
+    method,
+    table,
+    access_token,
+    params=None,
+    payload=None,
+    prefer=None,
+):
     if not SUPABASE_URL or not SUPABASE_KEY:
+        print("Supabase non configuré.")
         return None
 
     try:
@@ -130,11 +147,14 @@ def supabase_request(method, table, access_token, params=None, payload=None, pre
         return response.json()
 
     except Exception as exc:
-        print(f"Erreur requête Supabase {table} :", repr(exc))
+        print(f"Erreur Supabase {table} :", repr(exc))
         return None
 
 
 def get_authenticated_user(access_token):
+    if not SUPABASE_URL or not SUPABASE_KEY or not access_token:
+        return None
+
     try:
         response = requests.get(
             f"{SUPABASE_URL}/auth/v1/user",
@@ -145,7 +165,11 @@ def get_authenticated_user(access_token):
         if response.ok:
             return response.json()
 
-        print("Vérification utilisateur échouée :", response.status_code)
+        print(
+            "Vérification utilisateur échouée :",
+            response.status_code,
+            response.text[:300],
+        )
 
     except Exception as exc:
         print("Erreur vérification utilisateur :", repr(exc))
@@ -227,7 +251,7 @@ def sign_in(email, password):
     email = (email or "").strip().lower()
 
     if not email or not password:
-        return None, "Saisis ton adresse e-mail et ton mot de passe."
+        return None, "Saisis une adresse e-mail et un mot de passe."
 
     data, error = auth_request(
         "token?grant_type=password",
@@ -254,64 +278,11 @@ def sign_in(email, password):
     }, "Connexion réussie."
 
 
-def login_action(email, password, mode):
-    if mode == "Créer un compte":
-        session, message = sign_up(email, password)
-    else:
-        session, message = sign_in(email, password)
-
-    if not session:
-        return (
-            None,
-            f"**{message}**",
-            gr.update(visible=True),
-            gr.update(visible=False),
-            [],
-            None,
-        )
-
-    user = session.get("user", {})
-    user_id = user.get("id")
-
-    if not user_id:
-        return (
-            None,
-            "**Impossible de vérifier le compte utilisateur.**",
-            gr.update(visible=True),
-            gr.update(visible=False),
-            [],
-            None,
-        )
-
-    return (
-        session,
-        f"**{message}**",
-        gr.update(visible=False),
-        gr.update(visible=True),
-        [],
-        session["conversation_id"],
-    )
-
-
-def logout_action():
-    return (
-        None,
-        "**Vous êtes déconnecté.**",
-        gr.update(visible=True),
-        gr.update(visible=False),
-        [],
-        None,
-    )
-
-
 # =========================================================
 # 5. BASE DE CONNAISSANCES
 # =========================================================
 
 def load_knowledge(question, access_token):
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return ""
-
     records = supabase_request(
         "GET",
         "ayzora_knowledge",
@@ -407,34 +378,118 @@ def retrieve_memories_for_prompt(memories):
     return "\n".join(sections)[:12000]
 
 
+# =========================================================
+# 7. GEMINI AVEC NOUVELLES TENTATIVES ET MODÈLES DE SECOURS
+# =========================================================
+
+def generate_with_fallback(
+    contents,
+    temperature=0.4,
+    max_output_tokens=4096,
+    model_candidates=None,
+):
+    if not client:
+        raise RuntimeError("La clé GEMINI_API_KEY n'est pas configurée.")
+
+    candidates = model_candidates or MODEL_CANDIDATES
+    errors = []
+
+    for model_name in list(dict.fromkeys(candidates)):
+        for attempt in range(GEMINI_RETRIES):
+            try:
+                print(
+                    f"Appel Gemini : modèle={model_name}, "
+                    f"tentative={attempt + 1}"
+                )
+
+                return client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        temperature=temperature,
+                        max_output_tokens=max_output_tokens,
+                    ),
+                )
+
+            except Exception as exc:
+                error_message = str(exc)
+                errors.append(
+                    f"{model_name}: {type(exc).__name__}: "
+                    f"{error_message[:180]}"
+                )
+
+                text = error_message.lower()
+
+                retryable = any(
+                    code in text
+                    for code in (
+                        "503",
+                        "unavailable",
+                        "429",
+                        "resource_exhausted",
+                        "500",
+                        "internal",
+                        "502",
+                        "504",
+                        "deadline",
+                        "timed out",
+                        "timeout",
+                    )
+                )
+
+                print(
+                    f"Échec Gemini {model_name}, "
+                    f"tentative {attempt + 1} :",
+                    repr(exc),
+                )
+
+                if not retryable:
+                    if any(
+                        term in text
+                        for term in (
+                            "not found",
+                            "unsupported",
+                            "model",
+                        )
+                    ):
+                        break
+                    raise
+
+                if attempt < GEMINI_RETRIES - 1:
+                    time.sleep(1.5 * (2 ** attempt))
+                else:
+                    break
+
+    raise RuntimeError(
+        "Tous les modèles Gemini ont échoué. "
+        + " | ".join(errors[-6:])
+    )
+
+
 def summarize_and_store_memories(access_token, user_text, assistant_text):
     """
-    Extrait uniquement les informations durables explicitement données.
-    Les informations sont enregistrées dans le compte authentifié.
+    Extrait au maximum trois informations durables.
+    Une panne de mémoire ne doit pas interrompre le chat.
     """
 
     if not client or not user_text.strip():
         return
 
-    # Ne pas mémoriser automatiquement les fichiers seuls.
     prompt = f"""
 Tu es un extracteur de mémoire pour un assistant personnel.
 
-Extrais uniquement les informations durables explicitement données
+Extrais au maximum trois informations durables explicitement données
 par l'utilisateur et utiles pour de futures conversations.
 
 Règles :
-- N'infère pas de faits.
+- N'infère aucun fait.
 - N'enregistre aucun mot de passe, clé API ou secret.
-- N'enregistre pas de données médicales, bancaires ou autres données sensibles.
+- N'enregistre pas de données sensibles.
 - N'enregistre pas une question ponctuelle comme un souvenir.
-- Si l'utilisateur demande explicitement de retenir une préférence ou un projet,
-  conserve cette information.
-- Limite-toi à trois souvenirs.
-- Chaque souvenir doit être compréhensible sans le contexte de cette conversation.
-- Réponds uniquement en JSON, sous la forme d'une liste.
-- Les clés obligatoires sont category, title et content.
 - Si rien n'est durable, renvoie [].
+- Chaque souvenir doit être compréhensible sans le contexte.
+- Réponds uniquement en JSON sous forme d'une liste.
+- Les clés obligatoires sont category, title et content.
 
 Message utilisateur :
 {user_text[:2500]}
@@ -444,13 +499,10 @@ Réponse de l'assistant :
 """
 
     try:
-        result = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.1,
-                max_output_tokens=800,
-            ),
+        result = generate_with_fallback(
+            prompt,
+            temperature=0.1,
+            max_output_tokens=800,
         )
 
         raw = (result.text or "").strip()
@@ -515,7 +567,7 @@ def refresh_memory(session):
 
 
 # =========================================================
-# 7. HISTORIQUE DES CONVERSATIONS
+# 8. HISTORIQUE DES CONVERSATIONS
 # =========================================================
 
 def save_conversation(access_token, conversation_id, messages, title=None):
@@ -545,26 +597,158 @@ def save_conversation(access_token, conversation_id, messages, title=None):
     return result is not None
 
 
-def retrieve_recent_conversation(access_token):
+def get_conversation_choices(session):
+    if not session or not session.get("access_token"):
+        return []
+
     records = supabase_request(
         "GET",
         "ayzora_conversations",
-        access_token,
+        session["access_token"],
         params={
-            "select": "id,title,messages,updated_at",
+            "select": "id,title,updated_at",
             "order": "updated_at.desc",
+            "limit": "50",
+        },
+    )
+
+    if not isinstance(records, list):
+        return []
+
+    return [
+        (
+            f"{record.get('title') or 'Conversation'} — "
+            f"{str(record.get('updated_at') or '')[:16]}",
+            record["id"],
+        )
+        for record in records
+        if record.get("id")
+    ]
+
+
+def refresh_conversation_choices(session):
+    return gr.update(
+        choices=get_conversation_choices(session),
+        value=None,
+    )
+
+
+def load_conversation(session, conversation_id):
+    if not session or not session.get("access_token"):
+        return [], None, "Connecte-toi pour ouvrir une conversation."
+
+    if not conversation_id:
+        return [], None, "Choisis une conversation dans la liste."
+
+    records = supabase_request(
+        "GET",
+        "ayzora_conversations",
+        session["access_token"],
+        params={
+            "select": "id,title,messages",
+            "id": f"eq.{conversation_id}",
             "limit": "1",
         },
     )
 
-    if isinstance(records, list) and records:
-        return records[0]
+    if not isinstance(records, list) or not records:
+        return [], None, "Conversation introuvable."
 
-    return None
+    record = records[0]
+    messages = record.get("messages") or []
+
+    if not isinstance(messages, list):
+        messages = []
+
+    cleaned = []
+
+    for item in messages:
+        if (
+            isinstance(item, dict)
+            and item.get("role") in ("user", "assistant")
+        ):
+            content = item.get("content", "")
+
+            if isinstance(content, str):
+                cleaned.append(
+                    {
+                        "role": item["role"],
+                        "content": content,
+                    }
+                )
+
+    return (
+        cleaned,
+        record.get("id"),
+        f"Conversation ouverte : **{record.get('title') or 'Conversation'}**",
+    )
+
+
+def new_conversation(session):
+    new_id = str(uuid.uuid4())
+
+    if session:
+        session["conversation_id"] = new_id
+
+    return [], new_id, "Nouvelle conversation prête."
+
+
+def login_action(email, password, mode):
+    if mode == "Créer un compte":
+        session, message = sign_up(email, password)
+    else:
+        session, message = sign_in(email, password)
+
+    if not session:
+        return (
+            None,
+            f"**{message}**",
+            gr.update(visible=True),
+            gr.update(visible=False),
+            [],
+            None,
+            gr.update(choices=[], value=None),
+        )
+
+    if not session.get("user", {}).get("id"):
+        return (
+            None,
+            "**Impossible de vérifier le compte utilisateur.**",
+            gr.update(visible=True),
+            gr.update(visible=False),
+            [],
+            None,
+            gr.update(choices=[], value=None),
+        )
+
+    choices = get_conversation_choices(session)
+
+    return (
+        session,
+        f"**{message}**",
+        gr.update(visible=False),
+        gr.update(visible=True),
+        [],
+        session["conversation_id"],
+        gr.update(choices=choices, value=None),
+    )
+
+
+def logout_action():
+    return (
+        None,
+        "**Vous êtes déconnecté.**",
+        gr.update(visible=True),
+        gr.update(visible=False),
+        [],
+        None,
+        gr.update(choices=[], value=None),
+        "",
+    )
 
 
 # =========================================================
-# 8. EXTRACTION DU TEXTE DES DOCUMENTS
+# 9. EXTRACTION DU TEXTE DES DOCUMENTS
 # =========================================================
 
 def extract_document_text(file_path):
@@ -643,6 +827,7 @@ def extract_document_text(file_path):
             )
 
             sections = []
+            total = 0
 
             try:
                 for sheet in workbook.worksheets:
@@ -653,17 +838,18 @@ def extract_document_text(file_path):
                         max_row=150,
                         values_only=True,
                     ):
-                        sections.append(
-                            " | ".join(
-                                "" if value is None else str(value)
-                                for value in row
-                            )
+                        line = " | ".join(
+                            "" if value is None else str(value)
+                            for value in row
                         )
 
-                        if sum(map(len, sections)) > MAX_TEXT_CHARS:
+                        sections.append(line)
+                        total += len(line)
+
+                        if total >= MAX_TEXT_CHARS:
                             break
 
-                    if sum(map(len, sections)) > MAX_TEXT_CHARS:
+                    if total >= MAX_TEXT_CHARS:
                         break
 
             finally:
@@ -677,12 +863,15 @@ def extract_document_text(file_path):
         )
 
     except Exception as exc:
-        print(f"Erreur de lecture du fichier {path.name} :", repr(exc))
+        print(
+            f"Erreur de lecture du fichier {path.name} :",
+            repr(exc),
+        )
         return f"[Impossible de lire le fichier {path.name}.]"
 
 
 # =========================================================
-# 9. PRÉPARATION DES FICHIERS POUR GEMINI
+# 10. PRÉPARATION DES FICHIERS POUR GEMINI
 # =========================================================
 
 def prepare_file_parts(file_paths):
@@ -711,7 +900,9 @@ def prepare_file_parts(file_paths):
             continue
 
         if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
-            mime_type = mimetypes.guess_type(str(path))[0] or "image/jpeg"
+            mime_type = (
+                mimetypes.guess_type(str(path))[0] or "image/jpeg"
+            )
 
             parts.append(
                 types.Part.from_text(
@@ -742,7 +933,7 @@ def prepare_file_parts(file_paths):
 
 
 # =========================================================
-# 10. FONCTION PRINCIPALE DE L'ASSISTANT
+# 11. FONCTION PRINCIPALE DU CHAT
 # =========================================================
 
 def chat(message, history, session, conversation_id):
@@ -768,7 +959,6 @@ def chat(message, history, session, conversation_id):
     token = session["access_token"]
 
     try:
-        # Vérifier le compte avant d'accéder à ses données.
         user = get_authenticated_user(token)
 
         if not user:
@@ -824,7 +1014,7 @@ def chat(message, history, session, conversation_id):
             prompt_parts.append(
                 types.Part.from_text(
                     text=(
-                        "BASE DE CONNAISSANCES :\n"
+                        "BASE DE CONNAISSANCES VÉRIFIÉE :\n"
                         f"{knowledge}\n\n"
                         "Utilise ces informations lorsqu'elles sont pertinentes."
                     )
@@ -849,15 +1039,7 @@ def chat(message, history, session, conversation_id):
             )
         )
 
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                temperature=0.4,
-                max_output_tokens=4096,
-            ),
-        )
-
+        response = generate_with_fallback(contents)
         answer = (response.text or "").strip()
 
         if not answer:
@@ -880,20 +1062,22 @@ def chat(message, history, session, conversation_id):
         ])
 
         if not conversation_id:
-            conversation_id = session.get("conversation_id") or str(uuid.uuid4())
-            session["conversation_id"] = conversation_id
+            conversation_id = (
+                session.get("conversation_id") or str(uuid.uuid4())
+            )
+
+        session["conversation_id"] = conversation_id
 
         saved = save_conversation(
             token,
             conversation_id,
             current_history,
-            title=(question or "Conversation AYZORA")[:100],
+            title=(question or "Analyse de fichier")[:100],
         )
 
         if not saved:
             print("Attention : la conversation n'a pas été sauvegardée.")
 
-        # L'extraction de mémoire est indépendante de la réponse au chat.
         if question:
             summarize_and_store_memories(
                 token,
@@ -904,25 +1088,31 @@ def chat(message, history, session, conversation_id):
         return answer
 
     except Exception as exc:
-        import traceback
-
         print("ERREUR AYZORA AI :", repr(exc))
         traceback.print_exc()
 
-        if "503" in str(exc) or "UNAVAILABLE" in str(exc):
+        error_text = str(exc).lower()
+
+        if "503" in error_text or "unavailable" in error_text:
             return (
-                "Gemini est temporairement indisponible (503). "
-                "Réessaie dans quelques instants."
+                "Gemini est temporairement indisponible, même après les "
+                "tentatives et modèles de secours. Attends un peu puis réessaie."
+            )
+
+        if "429" in error_text or "resource_exhausted" in error_text:
+            return (
+                "La limite de requêtes Gemini a été atteinte. "
+                "Attends avant de réessayer."
             )
 
         return (
-            f"Une erreur est survenue : {type(exc).__name__}. "
+            f"Une erreur est survenue ({type(exc).__name__}). "
             "Consulte les logs Render pour le détail."
         )
 
 
 # =========================================================
-# 11. INTERFACE UTILISATEUR
+# 12. INTERFACE UTILISATEUR
 # =========================================================
 
 DESCRIPTION = """
@@ -936,6 +1126,7 @@ Ton assistant intelligent pour :
 
 Connecte-toi pour accéder à tes conversations et à ta mémoire personnelle.
 """
+
 
 with gr.Blocks(
     theme=gr.themes.Soft(),
@@ -984,9 +1175,27 @@ with gr.Blocks(
         login_status = gr.Markdown()
 
         with gr.Row():
+            new_chat_button = gr.Button(
+                "➕ Nouvelle conversation",
+                variant="primary",
+            )
+
             memory_button = gr.Button("🧠 Voir ma mémoire")
             logout_button = gr.Button("Se déconnecter")
 
+        with gr.Row():
+            conversation_picker = gr.Dropdown(
+                label="Conversations précédentes",
+                choices=[],
+                value=None,
+                interactive=True,
+                scale=4,
+            )
+
+            refresh_history_button = gr.Button("↻ Actualiser")
+            open_history_button = gr.Button("Ouvrir")
+
+        history_status = gr.Markdown()
         memory_view = gr.Markdown()
 
         chatbot = gr.ChatInterface(
@@ -1022,7 +1231,7 @@ with gr.Blocks(
                 session_state,
                 conversation_state,
             ],
-                        examples=[
+            examples=[
                 [
                     "Présente-toi et explique-moi tes capacités.",
                     None,
@@ -1057,6 +1266,7 @@ with gr.Blocks(
             app_panel,
             chatbot.chatbot,
             conversation_state,
+            conversation_picker,
         ],
     )
 
@@ -1070,6 +1280,8 @@ with gr.Blocks(
             app_panel,
             chatbot.chatbot,
             conversation_state,
+            conversation_picker,
+            memory_view,
         ],
     )
 
@@ -1079,6 +1291,35 @@ with gr.Blocks(
         outputs=[memory_view],
     )
 
+    refresh_history_button.click(
+        fn=refresh_conversation_choices,
+        inputs=[session_state],
+        outputs=[conversation_picker],
+    )
+
+    open_history_button.click(
+        fn=load_conversation,
+        inputs=[
+            session_state,
+            conversation_picker,
+        ],
+        outputs=[
+            chatbot.chatbot,
+            conversation_state,
+            history_status,
+        ],
+    )
+
+    new_chat_button.click(
+        fn=new_conversation,
+        inputs=[session_state],
+        outputs=[
+            chatbot.chatbot,
+            conversation_state,
+            history_status,
+        ],
+    )
+
     gr.Markdown(
         "---\n"
         "AYZORA AI · Assistant intelligent"
@@ -1086,7 +1327,7 @@ with gr.Blocks(
 
 
 # =========================================================
-# 12. DÉMARRAGE
+# 13. DÉMARRAGE
 # =========================================================
 
 if __name__ == "__main__":
