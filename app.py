@@ -1096,6 +1096,7 @@ def chat(message, history, session, conversation_id):
     if not client:
         return "La clé GEMINI_API_KEY n'est pas configurée sur Render."
 
+    # 1. Récupérer le message et les fichiers joints
     if isinstance(message, dict):
         question = str(message.get("text") or "").strip()
         file_paths = message.get("files") or []
@@ -1112,6 +1113,7 @@ def chat(message, history, session, conversation_id):
     token = session["access_token"]
 
     try:
+        # 2. Vérifier l'utilisateur connecté
         user = get_authenticated_user(token)
 
         if not user:
@@ -1120,10 +1122,61 @@ def chat(message, history, session, conversation_id):
                 "Déconnecte-toi, puis reconnecte-toi."
             )
 
+        # 3. Traiter les demandes explicites de mémorisation
+        # Cette fonction doit déjà exister dans app.py.
+        if question:
+            memory_result = handle_explicit_memory_request(
+                token,
+                question,
+            )
+
+            if memory_result:
+                answer = str(memory_result).strip()
+
+                current_history = list(history or [])
+                current_history.extend([
+                    {
+                        "role": "user",
+                        "content": question,
+                    },
+                    {
+                        "role": "assistant",
+                        "content": answer,
+                    },
+                ])
+
+                if not conversation_id:
+                    conversation_id = (
+                        session.get("conversation_id")
+                        or str(uuid.uuid4())
+                    )
+
+                session["conversation_id"] = conversation_id
+
+                saved = save_conversation(
+                    token,
+                    conversation_id,
+                    current_history,
+                    title=question[:100],
+                )
+
+                if not saved:
+                    print(
+                        "Attention : la conversation "
+                        "n'a pas été sauvegardée."
+                    )
+
+                return answer
+
+        # 4. Charger la mémoire persistante de l'utilisateur
         memories = load_memories(token)
+
         memory_text = retrieve_memories_for_prompt(memories)
+
+        # 5. Charger les connaissances pertinentes
         knowledge = load_knowledge(question, token)
 
+        # 6. Préparer l'historique de la conversation
         contents = []
 
         for item in (history or [])[-12:]:
@@ -1147,8 +1200,11 @@ def chat(message, history, session, conversation_id):
                     )
                 )
 
+        # 7. Construire les instructions envoyées à Gemini
         prompt_parts = [
-            types.Part.from_text(text=SYSTEM_INSTRUCTION)
+            types.Part.from_text(
+                text=SYSTEM_INSTRUCTION
+            )
         ]
 
         if memory_text:
@@ -1157,8 +1213,10 @@ def chat(message, history, session, conversation_id):
                     text=(
                         "MÉMOIRE PERSISTANTE DE CET UTILISATEUR :\n"
                         f"{memory_text}\n\n"
-                        "Utilise ces souvenirs uniquement s'ils sont "
-                        "pertinents pour la demande actuelle."
+                        "Utilise ces souvenirs uniquement lorsqu'ils "
+                        "sont pertinents pour la demande actuelle. "
+                        "Ne prétends pas te souvenir d'informations "
+                        "qui ne figurent pas dans cette mémoire."
                     )
                 )
             )
@@ -1167,9 +1225,10 @@ def chat(message, history, session, conversation_id):
             prompt_parts.append(
                 types.Part.from_text(
                     text=(
-                        "BASE DE CONNAISSANCES VÉRIFIÉE :\n"
+                        "BASE DE CONNAISSANCES :\n"
                         f"{knowledge}\n\n"
-                        "Utilise ces informations lorsqu'elles sont pertinentes."
+                        "Utilise ces informations lorsqu'elles sont "
+                        "pertinentes pour répondre."
                     )
                 )
             )
@@ -1183,7 +1242,10 @@ def chat(message, history, session, conversation_id):
             )
         )
 
-        prompt_parts.extend(prepare_file_parts(file_paths))
+        # 8. Ajouter les fichiers joints
+        prompt_parts.extend(
+            prepare_file_parts(file_paths)
+        )
 
         contents.append(
             types.Content(
@@ -1192,7 +1254,9 @@ def chat(message, history, session, conversation_id):
             )
         )
 
+        # 9. Générer la réponse avec Gemini
         response = generate_with_fallback(contents)
+
         answer = (response.text or "").strip()
 
         if not answer:
@@ -1201,6 +1265,7 @@ def chat(message, history, session, conversation_id):
                 "Essaie de reformuler ta question."
             )
 
+        # 10. Mettre à jour l'historique
         current_history = list(history or [])
 
         current_history.extend([
@@ -1214,13 +1279,16 @@ def chat(message, history, session, conversation_id):
             },
         ])
 
+        # 11. Identifier la conversation
         if not conversation_id:
             conversation_id = (
-                session.get("conversation_id") or str(uuid.uuid4())
+                session.get("conversation_id")
+                or str(uuid.uuid4())
             )
 
         session["conversation_id"] = conversation_id
 
+        # 12. Sauvegarder la conversation
         saved = save_conversation(
             token,
             conversation_id,
@@ -1229,15 +1297,26 @@ def chat(message, history, session, conversation_id):
         )
 
         if not saved:
-            print("Attention : la conversation n'a pas été sauvegardée.")
-
-        if question:
-            summarize_and_store_memories(
-                token,
-                question,
-                answer,
+            print(
+                "Attention : la conversation "
+                "n'a pas été sauvegardée."
             )
 
+        # 13. Extraire et enregistrer les souvenirs pertinents
+        if question:
+            try:
+                summarize_and_store_memories(
+                    token,
+                    question,
+                    answer,
+                )
+            except Exception as memory_error:
+                print(
+                    "Erreur pendant la sauvegarde de la mémoire :",
+                    repr(memory_error),
+                )
+
+        # 14. Retourner la réponse à l'utilisateur
         return answer
 
     except Exception as exc:
@@ -1248,8 +1327,8 @@ def chat(message, history, session, conversation_id):
 
         if "503" in error_text or "unavailable" in error_text:
             return (
-                "Gemini est temporairement indisponible, même après les "
-                "tentatives et modèles de secours. Attends un peu puis réessaie."
+                "Gemini est temporairement indisponible. "
+                "Attends un peu puis réessaie."
             )
 
         if "429" in error_text or "resource_exhausted" in error_text:
@@ -1262,7 +1341,6 @@ def chat(message, history, session, conversation_id):
             f"Une erreur est survenue ({type(exc).__name__}). "
             "Consulte les logs Render pour le détail."
         )
-
 
 # =========================================================
 # 12. INTERFACE UTILISATEUR
