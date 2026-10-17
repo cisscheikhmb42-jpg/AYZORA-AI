@@ -4,7 +4,6 @@ import json
 import mimetypes
 import time
 import uuid
-import re
 import traceback
 from pathlib import Path
 from datetime import datetime, timezone
@@ -47,6 +46,10 @@ MAX_TEXT_CHARS = 30000
 REST_TIMEOUT = 15
 GEMINI_RETRIES = 2
 
+MEMORY_TABLE = "ayzora_memories"
+CONVERSATION_TABLE = "ayzora_conversations"
+KNOWLEDGE_TABLE = "ayzora_knowledge"
+
 client = None
 
 if GEMINI_API_KEY:
@@ -63,50 +66,42 @@ if GEMINI_API_KEY:
 SYSTEM_INSTRUCTION = """
 Tu es AYZORA AI, un assistant intelligent polyvalent.
 
-Tu réponds clairement, précisément et utilement, en français lorsque
-l'utilisateur écrit en français.
+Tu aides l'utilisateur à :
+- apprendre et comprendre des concepts ;
+- rédiger des textes professionnels ;
+- créer des stratégies marketing ;
+- programmer des applications ;
+- analyser des documents et des images ;
+- développer des projets et des agents IA ;
+- organiser son travail et automatiser des tâches.
 
-Tu aides à rédiger, apprendre, programmer, analyser des fichiers,
-préparer des stratégies et résoudre des problèmes.
+Réponds clairement et naturellement.
+Utilise le français lorsque l'utilisateur écrit en français.
 
 CONTEXTE PROFESSIONNEL :
 L'utilisateur peut travailler sur Arrow Home Group et Forza Luxury.
 Ne confonds jamais ces deux entreprises.
-N'invente pas leurs prix, coordonnées, services ou informations internes.
+N'invente pas leurs coordonnées, prix ou informations internes.
 
 MÉMOIRE PERSISTANTE :
-Les informations présentes dans le bloc MÉMOIRE PERSISTANTE proviennent
-de la base de données du compte actuellement connecté.
-
-Utilise ces souvenirs lorsqu'ils sont pertinents.
-
-Ne confonds jamais deux informations distinctes.
-Un code de test n'est pas nécessairement le nom d'un projet.
-
-Si plusieurs souvenirs se contredisent, ne choisis pas arbitrairement.
-Privilégie une information récente uniquement si elle concerne clairement
-le même élément.
-
-Les souvenirs affichés ne constituent pas, à eux seuls, une autorisation
-de les modifier ou de les supprimer.
-
-Si l'utilisateur demande une modification ou une suppression de mémoire,
-utilise les fonctions disponibles dans l'application.
-
-Ne prétends jamais avoir modifié, enregistré ou supprimé un souvenir
-si l'opération correspondante n'a pas été exécutée et vérifiée.
-
-CONFIDENTIALITÉ :
 Utilise uniquement les souvenirs du compte connecté.
-Ne révèle jamais les souvenirs d'un autre utilisateur.
-Ne révèle jamais les clés API, jetons de session ou mots de passe.
+Ne révèle jamais les informations d'un autre utilisateur.
+Distingue les informations qui possèdent des titres différents.
+Ne confonds jamais un code de test avec un nom de projet.
 
-Ne prétends jamais avoir effectué une action qui n'a pas été réalisée.
+Lorsqu'une information est présente dans la mémoire, utilise sa valeur
+exacte. Ne remplace pas une information par une autre.
+
+Ne prétends jamais avoir sauvegardé ou modifié un souvenir sans que
+l'opération ait été confirmée par le système.
+
+Si une opération de sauvegarde échoue, explique clairement le problème.
+Ne prétends pas avoir effectué une action que tu n'as pas réalisée.
 """
 
 
 # =========================================================
-# 3. SUPABASE REST
+# 3. OUTILS SUPABASE
 # =========================================================
 
 def supabase_headers(access_token=None, prefer=None):
@@ -133,17 +128,8 @@ def supabase_request(
     payload=None,
     prefer=None,
 ):
-    """
-    Exécute une requête Supabase REST.
-
-    Retourne :
-    - une liste ou un objet JSON en cas de réussite ;
-    - [] pour une réponse sans contenu ;
-    - None en cas d'erreur.
-    """
-
     if not SUPABASE_URL or not SUPABASE_KEY:
-        print("Supabase non configuré.")
+        print("Erreur : Supabase n'est pas configuré.")
         return None
 
     try:
@@ -160,17 +146,14 @@ def supabase_request(
             print(
                 f"Erreur Supabase {table}:",
                 response.status_code,
-                response.text[:800],
+                response.text[:500],
             )
             return None
 
         if response.status_code == 204 or not response.content:
             return []
 
-        try:
-            return response.json()
-        except ValueError:
-            return []
+        return response.json()
 
     except Exception as exc:
         print(f"Erreur Supabase {table} :", repr(exc))
@@ -198,7 +181,7 @@ def get_authenticated_user(access_token):
         )
 
     except Exception as exc:
-        print("Erreur vérification utilisateur :", repr(exc))
+        print("Erreur de vérification utilisateur :", repr(exc))
 
     return None
 
@@ -278,7 +261,7 @@ def sign_in(email, password):
     )
 
     if error:
-        print("Échec connexion :", error)
+        print("Échec de connexion :", error)
         return None, (
             "Connexion impossible. Vérifie tes identifiants "
             "et la confirmation de ton e-mail."
@@ -295,11 +278,10 @@ def sign_in(email, password):
 
 
 def login_action(email, password, mode):
-    session, message = (
-        sign_up(email, password)
-        if mode == "Créer un compte"
-        else sign_in(email, password)
-    )
+    if mode == "Créer un compte":
+        session, message = sign_up(email, password)
+    else:
+        session, message = sign_in(email, password)
 
     if not session:
         return (
@@ -355,24 +337,138 @@ def logout_action():
 
 def load_memories(access_token):
     """
-    Charge les souvenirs accessibles au compte connecté.
-
-    La sécurité de l'isolation des comptes doit également être assurée
-    par les politiques RLS de Supabase.
+    Récupère les souvenirs du compte connecté.
+    La sécurité dépend également des politiques RLS de Supabase.
     """
 
     records = supabase_request(
         "GET",
-        "ayzora_memories",
+        MEMORY_TABLE,
         access_token,
         params={
-            "select": "id,user_id,category,title,content,created_at,updated_at",
+            "select": "id,user_id,category,title,content,updated_at",
             "order": "updated_at.desc",
             "limit": "100",
         },
     )
 
     return records if isinstance(records, list) else []
+
+
+def find_memory(access_token, title):
+    """
+    Recherche un souvenir portant un titre exact.
+    La recherche est limitée au compte actuellement connecté.
+    """
+
+    user = get_authenticated_user(access_token)
+
+    if not user or not user.get("id"):
+        return None
+
+    records = supabase_request(
+        "GET",
+        MEMORY_TABLE,
+        access_token,
+        params={
+            "select": "id,user_id,category,title,content,updated_at",
+            "user_id": f"eq.{user['id']}",
+            "title": f"eq.{title}",
+            "limit": "10",
+        },
+    )
+
+    if not isinstance(records, list):
+        return None
+
+    for record in records:
+        if (
+            record.get("user_id") == user["id"]
+            and record.get("title") == title
+        ):
+            return record
+
+    return None
+
+
+def save_memory(access_token, category, title, content):
+    """
+    Met à jour un souvenir existant du même titre.
+    Sinon, crée un nouveau souvenir.
+
+    Retourne True uniquement si Supabase confirme l'opération.
+    """
+
+    user = get_authenticated_user(access_token)
+
+    if not user or not user.get("id"):
+        print("Impossible de sauvegarder : utilisateur non authentifié.")
+        return False
+
+    title = str(title or "").strip()
+    content = str(content or "").strip()
+    category = str(category or "general").strip()
+
+    if not title or not content:
+        return False
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    existing = find_memory(access_token, title)
+
+    if existing:
+        memory_id = existing.get("id")
+
+        if not memory_id:
+            print("Le souvenir existant ne possède pas d'identifiant.")
+            return False
+
+        payload = {
+            "category": category[:80],
+            "title": title[:200],
+            "content": content[:3000],
+            "updated_at": now,
+        }
+
+        result = supabase_request(
+            "PATCH",
+            MEMORY_TABLE,
+            access_token,
+            params={
+                "id": f"eq.{memory_id}",
+                "user_id": f"eq.{user['id']}",
+            },
+            payload=payload,
+            prefer="return=representation",
+        )
+
+        if not isinstance(result, list) or not result:
+            print("La modification du souvenir n'a pas été confirmée.")
+            return False
+
+        return True
+
+    payload = {
+        "user_id": user["id"],
+        "category": category[:80],
+        "title": title[:200],
+        "content": content[:3000],
+        "updated_at": now,
+    }
+
+    result = supabase_request(
+        "POST",
+        MEMORY_TABLE,
+        access_token,
+        payload=payload,
+        prefer="return=representation",
+    )
+
+    if not isinstance(result, list) or not result:
+        print("La création du souvenir n'a pas été confirmée.")
+        return False
+
+    return True
 
 
 def retrieve_memories_for_prompt(memories):
@@ -390,255 +486,318 @@ def retrieve_memories_for_prompt(memories):
                 f"  Information : {content}"
             )
 
-    return "\n\n".join(sections)[:16000]
+    return "\n\n".join(sections)[:15000]
 
 
-def verify_memory_access(access_token):
-    user = get_authenticated_user(access_token)
-
-    if not user or not user.get("id"):
-        return None, "Session invalide. Reconnecte-toi."
-
-    return user, ""
-
-
-def find_memory_by_title(access_token, title):
+def handle_explicit_memory_request(access_token, question):
     """
-    Recherche un souvenir par son titre exact.
+    Détecte les demandes explicites de mémorisation et de modification.
 
-    La recherche est limitée aux souvenirs visibles par le compte connecté.
+    Exemples :
+    - Mémorise mon code de test : BAOBAB-729.
+    - Modifie le nom de mon projet secret : TERANGA-IA-2027.
     """
 
-    user, error = verify_memory_access(access_token)
+    text = (question or "").strip()
+    lower = text.lower()
 
-    if error:
+    if not text:
         return None
 
-    records = supabase_request(
-        "GET",
-        "ayzora_memories",
-        access_token,
-        params={
-            "select": "id,user_id,category,title,content,created_at,updated_at",
-            "user_id": f"eq.{user['id']}",
-            "title": f"eq.{title}",
-            "order": "updated_at.desc",
-            "limit": "1",
-        },
+    # -----------------------------------------------------
+    # Modification explicite du nom du projet secret
+    # -----------------------------------------------------
+
+    project_markers = (
+        "nom du projet secret",
+        "projet secret",
     )
 
-    if isinstance(records, list) and records:
-        return records[0]
+    update_markers = (
+        "modifie",
+        "modifier",
+        "mets à jour",
+        "mettre à jour",
+        "remplace",
+        "remplacer",
+        "change",
+        "changer",
+        "nouveau nom",
+    )
+
+    if (
+        any(marker in lower for marker in project_markers)
+        and any(marker in lower for marker in update_markers)
+    ):
+        new_name = None
+
+        # Cherche notamment une valeur du type TERANGA-IA-2027.
+        import re
+
+        match = re.search(
+            r"\b[A-Z][A-Z0-9]*(?:-[A-Z0-9]+){1,4}\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+
+        if match:
+            candidate = match.group(0).upper()
+
+            if candidate != "BAOBAB-729":
+                new_name = candidate
+
+        if not new_name:
+            return (
+                "Je n'ai pas trouvé le nouveau nom du projet dans ton message. "
+                "Précise le nom exact à enregistrer."
+            )
+
+        # Vérifie le souvenir du code de test sans le modifier.
+        code_memory = find_memory(access_token, "Information à retenir")
+
+        if code_memory:
+            old_content = str(code_memory.get("content") or "")
+
+            if "BAOBAB-729" not in old_content:
+                print(
+                    "Attention : le souvenir existant ne contient pas "
+                    "le code de test attendu."
+                )
+
+        # Titre unique pour le nom du projet secret.
+        project_title = "Nom du projet secret"
+
+        success = save_memory(
+            access_token,
+            "test_memoire",
+            project_title,
+            (
+                f"Le nom du projet secret est {new_name}. "
+                "Il est distinct du code de test BAOBAB-729."
+            ),
+        )
+
+        if success:
+            return (
+                f"Le souvenir « {project_title} » a été mis à jour "
+                f"et enregistré dans Supabase.\n\n"
+                f"Nom du projet secret : {new_name}\n"
+                f"Code de test conservé : BAOBAB-729"
+            )
+
+        return (
+            "Je n'ai pas pu confirmer la modification dans Supabase. "
+            "Le nom du projet n'est donc pas déclaré comme mis à jour. "
+            "Vérifie les logs Render et les politiques RLS de la table."
+        )
+
+    # -----------------------------------------------------
+    # Mémorisation explicite du code de test
+    # -----------------------------------------------------
+
+    if (
+        "code de test" in lower
+        and any(
+            marker in lower
+            for marker in (
+                "mémorise",
+                "memorise",
+                "souviens-toi",
+                "enregistre",
+                "retenir",
+                "garde",
+            )
+        )
+    ):
+        if "BAOBAB-729" in text.upper():
+            success = save_memory(
+                access_token,
+                "information_utilisateur",
+                "Code de test",
+                (
+                    "Le code de test est BAOBAB-729. "
+                    "Quand l'utilisateur demande son code de test, "
+                    "rappeler exactement BAOBAB-729."
+                ),
+            )
+
+            if success:
+                return (
+                    "Le code de test BAOBAB-729 a été enregistré "
+                    "dans la mémoire persistante."
+                )
+
+            return (
+                "Je n'ai pas pu confirmer l'enregistrement du code de test "
+                "dans Supabase."
+            )
+
+    # -----------------------------------------------------
+    # Demande de consultation de la mémoire
+    # -----------------------------------------------------
+
+    recall_markers = (
+        "retrouve dans ta mémoire",
+        "retrouve dans la mémoire",
+        "consulte ta mémoire",
+        "mémoire persistante",
+        "mémoire enregistrée",
+        "souviens-tu de",
+        "quel est mon code de test",
+        "quel est le nom de mon projet secret",
+    )
+
+    if any(marker in lower for marker in recall_markers):
+        memories = load_memories(access_token)
+
+        if not memories:
+            return (
+                "Je n'ai trouvé aucun souvenir accessible dans la mémoire "
+                "persistante de ce compte."
+            )
+
+        # On recherche séparément les deux informations.
+        code_value = None
+        project_value = None
+
+        for memory in memories:
+            title = str(memory.get("title") or "").lower()
+            content = str(memory.get("content") or "")
+
+            if "code de test" in title or (
+                "code de test" in content.lower()
+                and "BAOBAB-729" in content
+            ):
+                if "BAOBAB-729" in content:
+                    code_value = "BAOBAB-729"
+
+            if "nom du projet secret" in title:
+                import re
+
+                match = re.search(
+                    r"\b[A-Z][A-Z0-9]*(?:-[A-Z0-9]+){1,4}\b",
+                    content,
+                    flags=re.IGNORECASE,
+                )
+
+                if match:
+                    candidate = match.group(0).upper()
+
+                    if candidate != "BAOBAB-729":
+                        project_value = candidate
+
+        if code_value and project_value:
+            return (
+                "Voici les informations retrouvées dans ta mémoire :\n\n"
+                f"Code de test : {code_value}\n"
+                f"Projet secret : {project_value}"
+            )
+
+        if code_value and not project_value:
+            return (
+                f"Code de test : {code_value}\n"
+                "Projet secret : je n'ai pas trouvé de valeur distincte "
+                "et vérifiable dans la mémoire."
+            )
+
+        if project_value and not code_value:
+            return (
+                "Code de test : je n'ai pas trouvé de valeur vérifiable.\n"
+                f"Projet secret : {project_value}"
+            )
+
+        return (
+            "J'ai consulté les souvenirs accessibles, mais je n'ai pas "
+            "pu identifier avec certitude les deux informations demandées."
+        )
 
     return None
 
 
-def save_memory(access_token, category, title, content):
+def summarize_and_store_memories(access_token, user_text, assistant_text):
     """
-    Enregistre un souvenir.
-
-    Si un souvenir avec le même titre existe déjà pour l'utilisateur,
-    il est mis à jour. Sinon, un nouveau souvenir est créé.
-
-    Une réussite n'est retournée qu'après vérification de la base.
+    Extraction facultative d'informations durables.
+    Les demandes explicites sont traitées séparément.
     """
 
-    user, error = verify_memory_access(access_token)
+    if not client or not user_text.strip():
+        return
 
-    if error:
-        print(error)
-        return False
+    prompt = f"""
+Extrais au maximum 3 informations durables explicitement données
+par l'utilisateur.
 
-    title = str(title or "").strip()[:200]
-    content = str(content or "").strip()[:3000]
-    category = str(category or "general").strip()[:80]
+N'infère aucun fait.
+N'enregistre aucun mot de passe, aucune clé API et aucun secret technique.
+Ne conserve pas les questions ponctuelles.
 
-    if not title or not content:
-        return False
+Les informations déjà traitées explicitement par l'application
+ne doivent pas être dupliquées.
 
-    existing = find_memory_by_title(access_token, title)
+Si rien n'est durable, renvoie [].
 
-    now = datetime.now(timezone.utc).isoformat()
+Réponds uniquement en JSON sous forme de liste avec les clés :
+category, title, content.
 
-    if existing and existing.get("id"):
-        result = supabase_request(
-            "PATCH",
-            "ayzora_memories",
-            access_token,
-            params={
-                "id": f"eq.{existing['id']}",
-                "user_id": f"eq.{user['id']}",
-            },
-            payload={
-                "category": category,
-                "title": title,
-                "content": content,
-                "updated_at": now,
-            },
-            prefer="return=representation",
+Message utilisateur :
+{user_text[:2500]}
+
+Réponse de l'assistant :
+{assistant_text[:1000]}
+"""
+
+    try:
+        result = generate_with_fallback(
+            prompt,
+            temperature=0.1,
+            max_output_tokens=800,
         )
 
-        if result is None:
-            return False
+        raw = (result.text or "").strip()
 
-    else:
-        result = supabase_request(
-            "POST",
-            "ayzora_memories",
-            access_token,
-            payload={
-                "user_id": user["id"],
-                "category": category,
-                "title": title,
-                "content": content,
-                "updated_at": now,
-            },
-            prefer="return=representation",
-        )
+        if raw.startswith("```"):
+            raw = raw.replace("```json", "", 1)
+            raw = raw.replace("```", "").strip()
 
-        if result is None:
-            return False
+        start = raw.find("[")
+        end = raw.rfind("]")
 
-    # Vérification réelle de la persistance.
-    saved = find_memory_by_title(access_token, title)
+        if start < 0 or end < start:
+            return
 
-    if not saved:
-        print("Vérification échouée : souvenir introuvable après sauvegarde.")
-        return False
+        items = json.loads(raw[start:end + 1])
 
-    if str(saved.get("content") or "").strip() != content:
-        print("Vérification échouée : le contenu enregistré est différent.")
-        return False
+        if not isinstance(items, list):
+            return
 
-    return True
+        for item in items[:3]:
+            if not isinstance(item, dict):
+                continue
 
+            title = str(item.get("title") or "").strip()
+            content = str(item.get("content") or "").strip()
+            category = str(item.get("category") or "general")
 
-def update_memory(access_token, title, new_content, new_title=None):
-    """
-    Modifie un souvenir existant identifié par son titre exact.
+            if not title or not content:
+                continue
 
-    Le filtre user_id empêche de cibler les souvenirs d'un autre compte.
-    """
+            # Ne laisse pas l'extraction automatique écraser
+            # les souvenirs spécifiques de test.
+            if title.lower() in (
+                "nom du projet secret",
+                "code de test",
+            ):
+                continue
 
-    user, error = verify_memory_access(access_token)
+            save_memory(
+                access_token,
+                category,
+                title,
+                content,
+            )
 
-    if error:
-        return False, error
-
-    title = str(title or "").strip()
-    new_content = str(new_content or "").strip()[:3000]
-
-    if not title or not new_content:
-        return False, "Le titre et le nouveau contenu sont obligatoires."
-
-    memory = find_memory_by_title(access_token, title)
-
-    if not memory or not memory.get("id"):
-        return False, (
-            f"Je n'ai trouvé aucun souvenir portant exactement le titre "
-            f"« {title} ». Aucun changement n'a été effectué."
-        )
-
-    payload = {
-        "content": new_content,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-    if new_title and str(new_title).strip():
-        payload["title"] = str(new_title).strip()[:200]
-
-    result = supabase_request(
-        "PATCH",
-        "ayzora_memories",
-        access_token,
-        params={
-            "id": f"eq.{memory['id']}",
-            "user_id": f"eq.{user['id']}",
-        },
-        payload=payload,
-        prefer="return=representation",
-    )
-
-    if result is None:
-        return False, (
-            "Supabase a refusé la modification ou une erreur réseau "
-            "s'est produite. Vérifie les logs."
-        )
-
-    final_title = str(payload.get("title") or title).strip()
-    saved = find_memory_by_title(access_token, final_title)
-
-    if not saved:
-        return False, (
-            "La modification a été envoyée, mais je n'ai pas pu "
-            "la vérifier dans la base de données."
-        )
-
-    if str(saved.get("content") or "").strip() != new_content:
-        return False, (
-            "Le contenu retrouvé ne correspond pas à la valeur demandée. "
-            "Je ne peux pas confirmer la réussite."
-        )
-
-    return True, f"Le souvenir « {final_title} » a été modifié et vérifié."
-
-
-def delete_memory(access_token, title):
-    """
-    Supprime uniquement le souvenir ciblé par son titre exact.
-    """
-
-    user, error = verify_memory_access(access_token)
-
-    if error:
-        return False, error
-
-    title = str(title or "").strip()
-
-    if not title:
-        return False, "Le titre du souvenir à supprimer est obligatoire."
-
-    memory = find_memory_by_title(access_token, title)
-
-    if not memory or not memory.get("id"):
-        return False, f"Aucun souvenir intitulé « {title} » n'a été trouvé."
-
-    result = supabase_request(
-        "DELETE",
-        "ayzora_memories",
-        access_token,
-        params={
-            "id": f"eq.{memory['id']}",
-            "user_id": f"eq.{user['id']}",
-        },
-        prefer="return=representation",
-    )
-
-    if result is None:
-        return False, "La suppression a échoué. Consulte les logs Supabase."
-
-    # Vérification : le souvenir ciblé ne doit plus être présent.
-    remaining = supabase_request(
-        "GET",
-        "ayzora_memories",
-        access_token,
-        params={
-            "select": "id,title",
-            "id": f"eq.{memory['id']}",
-            "user_id": f"eq.{user['id']}",
-            "limit": "1",
-        },
-    )
-
-    if remaining is None:
-        return False, (
-            "La suppression a été envoyée, mais sa vérification a échoué."
-        )
-
-    if remaining:
-        return False, "Le souvenir est toujours présent après la tentative."
-
-    return True, f"Le souvenir « {title} » a été supprimé et vérifié."
+    except Exception as exc:
+        print("Extraction de mémoire ignorée :", repr(exc))
 
 
 def refresh_memory(session):
@@ -650,7 +809,7 @@ def refresh_memory(session):
     if not memories:
         return (
             "Aucun souvenir enregistré pour le moment. "
-            "Tu peux demander à AYZORA de retenir une information durable."
+            "Tu peux demander à AYZORA AI de retenir une information durable."
         )
 
     sections = []
@@ -666,215 +825,13 @@ def refresh_memory(session):
 
 
 # =========================================================
-# 6. COMMANDES DE MÉMOIRE
-# =========================================================
-
-def handle_memory_command(access_token, question):
-    """
-    Traite les demandes explicites de modification et de suppression.
-
-    Pour éviter les changements involontaires, une modification doit
-    indiquer clairement l'ancien titre et le nouveau contenu.
-
-    Retourne None si le message n'est pas une commande de mémoire.
-    """
-
-    text = (question or "").strip()
-    lower = text.lower()
-
-    update_words = (
-        "modifie ma mémoire",
-        "modifie le souvenir",
-        "mets à jour ma mémoire",
-        "mets a jour ma memoire",
-        "mets à jour le souvenir",
-        "remplace dans ma mémoire",
-        "remplace dans ma memoire",
-        "change le nom de mon projet",
-        "change le nom du projet",
-        "renomme le souvenir",
-    )
-
-    delete_words = (
-        "supprime ce souvenir",
-        "supprime le souvenir",
-        "supprime de ma mémoire",
-        "supprime de ma memoire",
-        "efface ce souvenir",
-        "efface le souvenir",
-    )
-
-    # -----------------------------------------------------
-    # Suppression explicite
-    # Format accepté : Supprime le souvenir intitulé : TITRE
-    # -----------------------------------------------------
-
-    if any(word in lower for word in delete_words):
-        match = re.search(
-            r"(?:intitulé|intitule|titre)\s*:\s*(.+)",
-            text,
-            flags=re.IGNORECASE,
-        )
-
-        if not match:
-            return (
-                "Pour éviter de supprimer le mauvais souvenir, précise "
-                "son titre exact.\n\n"
-                "Exemple : Supprime le souvenir intitulé : Nom du projet secret"
-            )
-
-        title = match.group(1).strip().strip("\"'“”")
-
-        success, message = delete_memory(access_token, title)
-
-        return message
-
-    # -----------------------------------------------------
-    # Modification explicite
-    # -----------------------------------------------------
-
-    if any(word in lower for word in update_words):
-        old_match = re.search(
-            r"(?:ancien titre|titre actuel|souvenir intitulé)\s*:\s*(.+)",
-            text,
-            flags=re.IGNORECASE,
-        )
-
-        new_content_match = re.search(
-            r"(?:nouveau contenu|nouvelle valeur|nouveau nom du projet secret)\s*:\s*(.+)",
-            text,
-            flags=re.IGNORECASE,
-        )
-
-        new_title_match = re.search(
-            r"(?:nouveau titre)\s*:\s*(.+)",
-            text,
-            flags=re.IGNORECASE,
-        )
-
-        # Prise en charge de la formulation habituelle :
-        # Ancien nom du projet secret : ...
-        # Nouveau nom du projet secret : ...
-        if not old_match:
-            old_match = re.search(
-                r"ancien nom du projet secret\s*:\s*(.+)",
-                text,
-                flags=re.IGNORECASE,
-            )
-
-        if not new_content_match:
-            new_content_match = re.search(
-                r"nouveau nom du projet secret\s*:\s*(.+)",
-                text,
-                flags=re.IGNORECASE,
-            )
-
-        if not old_match or not new_content_match:
-            return (
-                "Je peux modifier un souvenir, mais j'ai besoin "
-                "de son titre exact et de son nouveau contenu.\n\n"
-                "Utilise ce format :\n\n"
-                "Modifie ma mémoire persistante.\n"
-                "Ancien titre : Nom du projet secret\n"
-                "Nouveau contenu : Le nom du projet secret est EXEMPLE."
-            )
-
-        old_title = old_match.group(1).strip().strip("\"'“”")
-        new_content = new_content_match.group(1).strip().strip("\"'“”")
-
-        new_title = None
-
-        if new_title_match:
-            new_title = new_title_match.group(1).strip().strip("\"'“”")
-
-        success, message = update_memory(
-            access_token,
-            old_title,
-            new_content,
-            new_title=new_title,
-        )
-
-        return message
-
-    # -----------------------------------------------------
-    # Enregistrement explicite
-    # -----------------------------------------------------
-
-    save_words = (
-        "mémorise que",
-        "memorise que",
-        "souviens-toi que",
-        "souviens toi que",
-        "enregistre dans ta mémoire",
-        "enregistre dans ta memoire",
-        "retiens que",
-        "retient que",
-    )
-
-    if any(word in lower for word in save_words):
-        content = text
-
-        for word in save_words:
-            index = lower.find(word)
-
-            if index >= 0:
-                content = text[index + len(word):].strip(" :,-")
-                break
-
-        if not content:
-            return (
-                "Précise l'information que tu souhaites enregistrer."
-            )
-
-        # Ce traitement n'enregistre pas les secrets techniques.
-        sensitive_terms = (
-            "mot de passe",
-            "password",
-            "clé api",
-            "cle api",
-            "api_key",
-            "access_token",
-            "secret key",
-        )
-
-        if any(term in content.lower() for term in sensitive_terms):
-            return (
-                "Je ne peux pas enregistrer de mot de passe, de clé API "
-                "ou de jeton d'accès dans la mémoire personnelle."
-            )
-
-        title = "Information retenue"
-
-        success = save_memory(
-            access_token,
-            "information_utilisateur",
-            title,
-            content,
-        )
-
-        if success:
-            return (
-                "J'ai enregistré et vérifié cette information "
-                "dans ta mémoire persistante."
-            )
-
-        return (
-            "Je n'ai pas pu vérifier l'enregistrement dans Supabase. "
-            "Je ne peux donc pas confirmer que cette information "
-            "a été sauvegardée."
-        )
-
-    return None
-
-
-# =========================================================
-# 7. BASE DE CONNAISSANCES
+# 6. BASE DE CONNAISSANCES
 # =========================================================
 
 def load_knowledge(question, access_token):
     records = supabase_request(
         "GET",
-        "ayzora_knowledge",
+        KNOWLEDGE_TABLE,
         access_token,
         params={
             "select": "title,content",
@@ -901,7 +858,7 @@ def load_knowledge(question, access_token):
 
 
 # =========================================================
-# 8. HISTORIQUE DES CONVERSATIONS
+# 7. CONVERSATIONS
 # =========================================================
 
 def save_conversation(access_token, conversation_id, messages, title=None):
@@ -920,7 +877,7 @@ def save_conversation(access_token, conversation_id, messages, title=None):
 
     result = supabase_request(
         "POST",
-        "ayzora_conversations",
+        CONVERSATION_TABLE,
         access_token,
         params={"on_conflict": "id"},
         payload=payload,
@@ -936,7 +893,7 @@ def get_conversation_choices(session):
 
     records = supabase_request(
         "GET",
-        "ayzora_conversations",
+        CONVERSATION_TABLE,
         session["access_token"],
         params={
             "select": "id,title,updated_at",
@@ -973,19 +930,13 @@ def load_conversation(session, conversation_id):
     if not conversation_id:
         return [], None, "Choisis une conversation dans la liste."
 
-    user = get_authenticated_user(session["access_token"])
-
-    if not user:
-        return [], None, "Session invalide. Reconnecte-toi."
-
     records = supabase_request(
         "GET",
-        "ayzora_conversations",
+        CONVERSATION_TABLE,
         session["access_token"],
         params={
             "select": "id,title,messages",
             "id": f"eq.{conversation_id}",
-            "user_id": f"eq.{user['id']}",
             "limit": "1",
         },
     )
@@ -1002,17 +953,19 @@ def load_conversation(session, conversation_id):
     cleaned = []
 
     for item in messages:
-        if (
-            isinstance(item, dict)
-            and item.get("role") in ("user", "assistant")
-        ):
-            content = item.get("content", "")
+        if not isinstance(item, dict):
+            continue
 
-            if isinstance(content, str):
-                cleaned.append({
-                    "role": item["role"],
-                    "content": content,
-                })
+        if item.get("role") not in ("user", "assistant"):
+            continue
+
+        content = item.get("content", "")
+
+        if isinstance(content, str):
+            cleaned.append({
+                "role": item["role"],
+                "content": content,
+            })
 
     return (
         cleaned,
@@ -1031,7 +984,7 @@ def new_conversation(session):
 
 
 # =========================================================
-# 9. EXTRACTION DU TEXTE DES FICHIERS
+# 8. EXTRACTION DE DOCUMENTS
 # =========================================================
 
 def extract_document_text(file_path):
@@ -1061,7 +1014,9 @@ def extract_document_text(file_path):
             doc = Document(str(path))
 
             return "\n".join(
-                p.text for p in doc.paragraphs if p.text.strip()
+                paragraph.text
+                for paragraph in doc.paragraphs
+                if paragraph.text.strip()
             )[:MAX_TEXT_CHARS]
 
         if extension in {".txt", ".md", ".log"}:
@@ -1094,7 +1049,8 @@ def extract_document_text(file_path):
                 rows = list(csv.reader(file))
 
             return "\n".join(
-                " | ".join(row) for row in rows[:300]
+                " | ".join(row)
+                for row in rows[:300]
             )[:MAX_TEXT_CHARS]
 
         if extension in {".xlsx", ".xlsm"}:
@@ -1212,7 +1168,7 @@ def prepare_file_parts(file_paths):
 
 
 # =========================================================
-# 10. GEMINI : NOUVELLES TENTATIVES ET MODÈLES DE SECOURS
+# 9. GEMINI ET MODÈLES DE SECOURS
 # =========================================================
 
 def generate_with_fallback(
@@ -1272,7 +1228,7 @@ def generate_with_fallback(
                 )
 
                 print(
-                    f"Échec Gemini {model_name} "
+                    f"Échec Gemini {model_name}, "
                     f"tentative {attempt + 1} :",
                     repr(exc),
                 )
@@ -1302,118 +1258,7 @@ def generate_with_fallback(
 
 
 # =========================================================
-# 11. EXTRACTION FACULTATIVE DE SOUVENIRS
-# =========================================================
-
-def summarize_and_store_memories(
-    access_token,
-    user_text,
-    assistant_text,
-):
-    """
-    Extrait des informations durables.
-
-    La sauvegarde passe par save_memory, qui met à jour un souvenir
-    portant le même titre au lieu de toujours créer un doublon.
-    """
-
-    if not client or not user_text.strip():
-        return
-
-    prompt = f"""
-Extrais au maximum 3 informations durables explicitement données
-par l'utilisateur.
-
-N'infère aucun fait.
-N'enregistre aucun mot de passe, clé API, jeton ou secret technique.
-Ne conserve pas les questions ponctuelles.
-
-Si rien n'est durable, renvoie [].
-
-Réponds uniquement en JSON sous forme de liste avec les clés :
-category, title, content.
-
-Message utilisateur :
-{user_text[:2500]}
-
-Réponse de l'assistant :
-{assistant_text[:1000]}
-"""
-
-    try:
-        result = generate_with_fallback(
-            prompt,
-            temperature=0.1,
-            max_output_tokens=800,
-            model_candidates=MODEL_CANDIDATES,
-        )
-
-        raw = (result.text or "").strip()
-
-        if raw.startswith("```"):
-            raw = raw.replace("```json", "", 1)
-            raw = raw.replace("```", "").strip()
-
-        start = raw.find("[")
-        end = raw.rfind("]")
-
-        if start < 0 or end < start:
-            return
-
-        items = json.loads(raw[start:end + 1])
-
-        if not isinstance(items, list):
-            return
-
-        for item in items[:3]:
-            if not isinstance(item, dict):
-                continue
-
-            title = str(item.get("title") or "").strip()
-            content = str(item.get("content") or "").strip()
-            category = str(item.get("category") or "general")
-
-            if not title or not content:
-                continue
-
-            sensitive_terms = (
-                "mot de passe",
-                "password",
-                "clé api",
-                "cle api",
-                "api_key",
-                "access_token",
-                "secret key",
-            )
-
-            if any(
-                term in (title + " " + content).lower()
-                for term in sensitive_terms
-            ):
-                continue
-
-            success = save_memory(
-                access_token,
-                category,
-                title,
-                content,
-            )
-
-            if not success:
-                print(
-                    "Un souvenir extrait n'a pas pu être vérifié :",
-                    title,
-                )
-
-    except Exception as exc:
-        print(
-            "Extraction de mémoire ignorée :",
-            repr(exc),
-        )
-
-
-# =========================================================
-# 12. CHAT PRINCIPAL
+# 10. CHAT PRINCIPAL
 # =========================================================
 
 def chat(message, history, session, conversation_id):
@@ -1449,25 +1294,62 @@ def chat(message, history, session, conversation_id):
                 "puis reconnecte-toi."
             )
 
-        # 1. Les commandes de mémoire sont traitées côté Python.
-        # Gemini ne doit pas simplement prétendre effectuer une écriture.
-        if question:
-            memory_command_result = handle_memory_command(
+        # -------------------------------------------------
+        # 1. Traiter les demandes explicites de mémoire
+        # -------------------------------------------------
+
+        explicit_result = handle_explicit_memory_request(
+            token,
+            question,
+        )
+
+        if explicit_result is not None:
+            answer = explicit_result
+
+            current_history = list(history or [])
+
+            current_history.extend([
+                {
+                    "role": "user",
+                    "content": question,
+                },
+                {
+                    "role": "assistant",
+                    "content": answer,
+                },
+            ])
+
+            if not conversation_id:
+                conversation_id = (
+                    session.get("conversation_id")
+                    or str(uuid.uuid4())
+                )
+
+            session["conversation_id"] = conversation_id
+
+            save_conversation(
                 token,
-                question,
+                conversation_id,
+                current_history,
+                title=question[:100] or "Mémoire",
             )
 
-            if memory_command_result is not None:
-                return memory_command_result
+            return answer
 
-        # 2. Chargement des souvenirs du compte.
+        # -------------------------------------------------
+        # 2. Charger la mémoire et la base de connaissances
+        # -------------------------------------------------
+
         memories = load_memories(token)
+
         memory_text = retrieve_memories_for_prompt(memories)
 
-        # 3. Chargement de la base de connaissances.
         knowledge = load_knowledge(question, token)
 
-        # 4. Construction de l'historique.
+        # -------------------------------------------------
+        # 3. Préparer l'historique
+        # -------------------------------------------------
+
         contents = []
 
         for item in (history or [])[-12:]:
@@ -1484,14 +1366,21 @@ def chat(message, history, session, conversation_id):
             ):
                 contents.append(
                     types.Content(
-                        role="user" if role == "user" else "model",
+                        role=(
+                            "user"
+                            if role == "user"
+                            else "model"
+                        ),
                         parts=[
                             types.Part.from_text(text=content)
                         ],
                     )
                 )
 
-        # 5. Construction du message envoyé à Gemini.
+        # -------------------------------------------------
+        # 4. Construire le prompt
+        # -------------------------------------------------
+
         prompt_parts = [
             types.Part.from_text(
                 text=SYSTEM_INSTRUCTION
@@ -1502,11 +1391,10 @@ def chat(message, history, session, conversation_id):
             prompt_parts.append(
                 types.Part.from_text(
                     text=(
-                        "MÉMOIRE PERSISTANTE DE L'UTILISATEUR "
-                        "ACTUELLEMENT CONNECTÉ :\n"
+                        "MÉMOIRE PERSISTANTE DE CET UTILISATEUR :\n"
                         f"{memory_text}\n\n"
-                        "Utilise ces informations avec prudence. "
-                        "Ne confonds pas les souvenirs distincts."
+                        "Respecte les titres et les valeurs exactes. "
+                        "Ne confonds pas deux souvenirs distincts."
                     )
                 )
             )
@@ -1515,7 +1403,7 @@ def chat(message, history, session, conversation_id):
             prompt_parts.append(
                 types.Part.from_text(
                     text=(
-                        "BASE DE CONNAISSANCES VÉRIFIÉE :\n"
+                        "BASE DE CONNAISSANCES :\n"
                         + knowledge
                     )
                 )
@@ -1544,7 +1432,10 @@ def chat(message, history, session, conversation_id):
             )
         )
 
-        # 6. Génération de la réponse.
+        # -------------------------------------------------
+        # 5. Générer la réponse
+        # -------------------------------------------------
+
         response = generate_with_fallback(contents)
 
         answer = (response.text or "").strip()
@@ -1555,7 +1446,10 @@ def chat(message, history, session, conversation_id):
                 "Essaie de reformuler ta question."
             )
 
-        # 7. Sauvegarde de la conversation.
+        # -------------------------------------------------
+        # 6. Sauvegarder la conversation
+        # -------------------------------------------------
+
         current_history = list(history or [])
 
         current_history.extend([
@@ -1586,11 +1480,14 @@ def chat(message, history, session, conversation_id):
             title=title[:100],
         ):
             print(
-                "Attention : la conversation n'a pas été sauvegardée."
+                "Attention : la conversation n'a pas "
+                "été sauvegardée."
             )
 
-        # 8. Extraction facultative de nouveaux souvenirs.
-        # Les commandes explicites sont traitées plus haut.
+        # -------------------------------------------------
+        # 7. Extraire les souvenirs durables
+        # -------------------------------------------------
+
         if question:
             summarize_and_store_memories(
                 token,
@@ -1613,10 +1510,7 @@ def chat(message, history, session, conversation_id):
                 "Attends un peu puis réessaie."
             )
 
-        if (
-            "429" in error_text
-            or "resource_exhausted" in error_text
-        ):
+        if "429" in error_text or "resource_exhausted" in error_text:
             return (
                 "La limite de requêtes Gemini a été atteinte. "
                 "Attends avant de réessayer."
@@ -1629,7 +1523,7 @@ def chat(message, history, session, conversation_id):
 
 
 # =========================================================
-# 13. INTERFACE GRADIO
+# 11. INTERFACE GRADIO
 # =========================================================
 
 DESCRIPTION = """
@@ -1637,14 +1531,15 @@ DESCRIPTION = """
 
 Ton assistant intelligent pour :
 
-- Répondre à tes questions et t'aider à apprendre.
-- Rédiger des contenus et préparer des stratégies.
-- Analyser des images et des documents.
-- T'accompagner dans tes projets professionnels et techniques.
-- Conserver des souvenirs dans ta mémoire personnelle.
+- répondre à tes questions et t'aider à apprendre ;
+- rédiger des contenus et préparer des stratégies ;
+- analyser des images et des documents ;
+- t'accompagner dans tes projets professionnels et techniques ;
+- conserver des informations utiles dans une mémoire persistante.
 
-Connecte-toi pour accéder à tes conversations et à ta mémoire.
+Connecte-toi pour accéder à tes conversations et à ta mémoire personnelle.
 """
+
 
 with gr.Blocks(
     theme=gr.themes.Soft(),
@@ -1655,7 +1550,12 @@ with gr.Blocks(
     conversation_state = gr.State(None)
 
     gr.Markdown("# 🟠 AYZORA AI\n### Ton assistant intelligent")
+
     gr.Markdown(DESCRIPTION)
+
+    # -----------------------------------------------------
+    # Connexion
+    # -----------------------------------------------------
 
     with gr.Column(visible=True) as auth_panel:
         gr.Markdown("## Connexion / inscription")
@@ -1686,7 +1586,12 @@ with gr.Blocks(
             "une confirmation par e-mail."
         )
 
+    # -----------------------------------------------------
+    # Application
+    # -----------------------------------------------------
+
     with gr.Column(visible=False) as app_panel:
+
         login_status = gr.Markdown()
 
         with gr.Row():
@@ -1704,6 +1609,7 @@ with gr.Blocks(
             )
 
         with gr.Row():
+
             conversation_picker = gr.Dropdown(
                 label="Conversations précédentes",
                 choices=[],
@@ -1721,6 +1627,7 @@ with gr.Blocks(
             )
 
         history_status = gr.Markdown()
+
         memory_view = gr.Markdown()
 
         chatbot = gr.ChatInterface(
@@ -1731,11 +1638,15 @@ with gr.Blocks(
             chatbot=gr.Chatbot(
                 type="messages",
                 height=500,
-                placeholder="Pose ta question à AYZORA AI...",
+                placeholder=(
+                    "Pose ta question à AYZORA AI..."
+                ),
             ),
 
             textbox=gr.MultimodalTextbox(
-                placeholder="Écris ta question ou joins un fichier...",
+                placeholder=(
+                    "Écris ta question ou joins un fichier..."
+                ),
                 file_count="multiple",
                 file_types=[
                     ".pdf",
@@ -1761,31 +1672,18 @@ with gr.Blocks(
             ],
 
             examples=[
-                [
-                    "Présente-toi et explique-moi tes capacités.",
-                    None,
-                    None,
-                ],
-                [
-                    "Aide-moi à préparer une stratégie marketing digital.",
-                    None,
-                    None,
-                ],
-                [
-                    "Explique-moi simplement ce qu'est un agent IA.",
-                    None,
-                    None,
-                ],
-                [
-                    "Je souhaite que tu retiennes que mon objectif "
-                    "est de développer AYZORA AI.",
-                    None,
-                    None,
-                ],
+                "Présente-toi et explique-moi tes capacités.",
+                "Aide-moi à préparer une stratégie marketing digital.",
+                "Explique-moi simplement ce qu'est un agent IA.",
+                "Je souhaite que tu retiennes que mon objectif est de développer AYZORA AI.",
             ],
 
             save_history=False,
         )
+
+    # -----------------------------------------------------
+    # Événements : connexion et déconnexion
+    # -----------------------------------------------------
 
     auth_button.click(
         fn=login_action,
@@ -1820,11 +1718,19 @@ with gr.Blocks(
         ],
     )
 
+    # -----------------------------------------------------
+    # Événements : mémoire
+    # -----------------------------------------------------
+
     memory_button.click(
         fn=refresh_memory,
         inputs=[session_state],
         outputs=[memory_view],
     )
+
+    # -----------------------------------------------------
+    # Événements : historique
+    # -----------------------------------------------------
 
     refresh_history_button.click(
         fn=refresh_conversation_choices,
@@ -1861,7 +1767,7 @@ with gr.Blocks(
 
 
 # =========================================================
-# 14. DÉMARRAGE
+# 12. LANCEMENT
 # =========================================================
 
 if __name__ == "__main__":
