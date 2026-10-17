@@ -4,6 +4,7 @@ import json
 import mimetypes
 import time
 import uuid
+import re
 import traceback
 from pathlib import Path
 from datetime import datetime, timezone
@@ -19,10 +20,10 @@ from google.genai import types
 # =========================================================
 
 APP_NAME = "AYZORA AI"
+
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
 
-# Ordre de secours configurable depuis Render.
 FALLBACK_MODELS = [
     model.strip()
     for model in os.getenv(
@@ -31,9 +32,11 @@ FALLBACK_MODELS = [
     ).split(",")
     if model.strip()
 ]
+
 MODEL_CANDIDATES = list(dict.fromkeys([GEMINI_MODEL] + FALLBACK_MODELS))
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+
 SUPABASE_KEY = (
     os.getenv("SUPABASE_PUBLISHABLE_KEY", "").strip()
     or os.getenv("SUPABASE_ANON_KEY", "").strip()
@@ -45,6 +48,7 @@ REST_TIMEOUT = 15
 GEMINI_RETRIES = 2
 
 client = None
+
 if GEMINI_API_KEY:
     try:
         client = genai.Client(api_key=GEMINI_API_KEY)
@@ -53,27 +57,51 @@ if GEMINI_API_KEY:
 
 
 # =========================================================
-# 2. INSTRUCTIONS
+# 2. INSTRUCTIONS DE L'ASSISTANT
 # =========================================================
 
 SYSTEM_INSTRUCTION = """
 Tu es AYZORA AI, un assistant intelligent polyvalent.
-Réponds clairement, précisément et utilement, en français lorsque l'utilisateur
-écrit en français. Aide à rédiger, apprendre, programmer, analyser des fichiers,
+
+Tu réponds clairement, précisément et utilement, en français lorsque
+l'utilisateur écrit en français.
+
+Tu aides à rédiger, apprendre, programmer, analyser des fichiers,
 préparer des stratégies et résoudre des problèmes.
 
 CONTEXTE PROFESSIONNEL :
 L'utilisateur peut travailler sur Arrow Home Group et Forza Luxury.
-Ne confonds jamais ces deux entreprises. N'invente pas leurs prix, coordonnées,
-services ou informations internes. Utilise les informations fournies par
-l'utilisateur, les documents, la mémoire et la base de connaissances.
+Ne confonds jamais ces deux entreprises.
+N'invente pas leurs prix, coordonnées, services ou informations internes.
 
-MÉMOIRE ET CONFIDENTIALITÉ :
-Utilise uniquement les souvenirs du compte actuellement connecté.
+MÉMOIRE PERSISTANTE :
+Les informations présentes dans le bloc MÉMOIRE PERSISTANTE proviennent
+de la base de données du compte actuellement connecté.
+
+Utilise ces souvenirs lorsqu'ils sont pertinents.
+
+Ne confonds jamais deux informations distinctes.
+Un code de test n'est pas nécessairement le nom d'un projet.
+
+Si plusieurs souvenirs se contredisent, ne choisis pas arbitrairement.
+Privilégie une information récente uniquement si elle concerne clairement
+le même élément.
+
+Les souvenirs affichés ne constituent pas, à eux seuls, une autorisation
+de les modifier ou de les supprimer.
+
+Si l'utilisateur demande une modification ou une suppression de mémoire,
+utilise les fonctions disponibles dans l'application.
+
+Ne prétends jamais avoir modifié, enregistré ou supprimé un souvenir
+si l'opération correspondante n'a pas été exécutée et vérifiée.
+
+CONFIDENTIALITÉ :
+Utilise uniquement les souvenirs du compte connecté.
 Ne révèle jamais les souvenirs d'un autre utilisateur.
-Ne prétends pas avoir sauvegardé une information si la sauvegarde n'a pas réussi.
-N'invente pas d'informations et signale clairement les incertitudes.
-Ne prétends pas avoir effectué une action que tu n'as pas réalisée.
+Ne révèle jamais les clés API, jetons de session ou mots de passe.
+
+Ne prétends jamais avoir effectué une action qui n'a pas été réalisée.
 """
 
 
@@ -84,20 +112,40 @@ Ne prétends pas avoir effectué une action que tu n'as pas réalisée.
 def supabase_headers(access_token=None, prefer=None):
     if not SUPABASE_KEY:
         return {}
+
     headers = {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {access_token or SUPABASE_KEY}",
         "Content-Type": "application/json",
     }
+
     if prefer:
         headers["Prefer"] = prefer
+
     return headers
 
 
-def supabase_request(method, table, access_token, params=None, payload=None, prefer=None):
+def supabase_request(
+    method,
+    table,
+    access_token,
+    params=None,
+    payload=None,
+    prefer=None,
+):
+    """
+    Exécute une requête Supabase REST.
+
+    Retourne :
+    - une liste ou un objet JSON en cas de réussite ;
+    - [] pour une réponse sans contenu ;
+    - None en cas d'erreur.
+    """
+
     if not SUPABASE_URL or not SUPABASE_KEY:
         print("Supabase non configuré.")
         return None
+
     try:
         response = requests.request(
             method=method,
@@ -107,12 +155,23 @@ def supabase_request(method, table, access_token, params=None, payload=None, pre
             json=payload,
             timeout=REST_TIMEOUT,
         )
+
         if not response.ok:
-            print(f"Erreur Supabase {table}:", response.status_code, response.text[:500])
+            print(
+                f"Erreur Supabase {table}:",
+                response.status_code,
+                response.text[:800],
+            )
             return None
+
         if response.status_code == 204 or not response.content:
             return []
-        return response.json()
+
+        try:
+            return response.json()
+        except ValueError:
+            return []
+
     except Exception as exc:
         print(f"Erreur Supabase {table} :", repr(exc))
         return None
@@ -121,17 +180,26 @@ def supabase_request(method, table, access_token, params=None, payload=None, pre
 def get_authenticated_user(access_token):
     if not SUPABASE_URL or not SUPABASE_KEY or not access_token:
         return None
+
     try:
         response = requests.get(
             f"{SUPABASE_URL}/auth/v1/user",
             headers=supabase_headers(access_token),
             timeout=REST_TIMEOUT,
         )
+
         if response.ok:
             return response.json()
-        print("Vérification utilisateur échouée :", response.status_code, response.text[:300])
+
+        print(
+            "Vérification utilisateur échouée :",
+            response.status_code,
+            response.text[:300],
+        )
+
     except Exception as exc:
         print("Erreur vérification utilisateur :", repr(exc))
+
     return None
 
 
@@ -142,6 +210,7 @@ def get_authenticated_user(access_token):
 def auth_request(endpoint, payload):
     if not SUPABASE_URL or not SUPABASE_KEY:
         return None, "Supabase n'est pas configuré sur Render."
+
     try:
         response = requests.post(
             f"{SUPABASE_URL}/auth/v1/{endpoint}",
@@ -149,13 +218,19 @@ def auth_request(endpoint, payload):
             json=payload,
             timeout=REST_TIMEOUT,
         )
+
         data = response.json() if response.content else {}
+
         if not response.ok:
             return None, (
-                data.get("msg") or data.get("message")
-                or data.get("error_description") or "Erreur d'authentification."
+                data.get("msg")
+                or data.get("message")
+                or data.get("error_description")
+                or "Erreur d'authentification."
             )
+
         return data, ""
+
     except Exception as exc:
         print("Erreur Supabase Auth :", repr(exc))
         return None, "Impossible de joindre Supabase. Réessaie."
@@ -163,15 +238,27 @@ def auth_request(endpoint, payload):
 
 def sign_up(email, password):
     email = (email or "").strip().lower()
+
     if not email or not password:
         return None, "Saisis une adresse e-mail et un mot de passe."
+
     if len(password) < 12:
         return None, "Le mot de passe doit contenir au moins 12 caractères."
-    data, error = auth_request("signup", {"email": email, "password": password})
+
+    data, error = auth_request(
+        "signup",
+        {"email": email, "password": password},
+    )
+
     if error:
         return None, error
+
     if not data.get("access_token"):
-        return None, "Inscription envoyée. Confirme ton adresse e-mail, puis connecte-toi."
+        return None, (
+            "Inscription envoyée. Confirme ton adresse e-mail, "
+            "puis connecte-toi."
+        )
+
     return {
         "access_token": data["access_token"],
         "user": data.get("user", {}),
@@ -181,17 +268,25 @@ def sign_up(email, password):
 
 def sign_in(email, password):
     email = (email or "").strip().lower()
+
     if not email or not password:
         return None, "Saisis ton adresse e-mail et ton mot de passe."
+
     data, error = auth_request(
         "token?grant_type=password",
         {"email": email, "password": password},
     )
+
     if error:
         print("Échec connexion :", error)
-        return None, "Connexion impossible. Vérifie tes identifiants et la confirmation de ton e-mail."
+        return None, (
+            "Connexion impossible. Vérifie tes identifiants "
+            "et la confirmation de ton e-mail."
+        )
+
     if not data.get("access_token") or not data.get("user"):
         return None, "Supabase n'a pas renvoyé de session valide."
+
     return {
         "access_token": data["access_token"],
         "user": data["user"],
@@ -201,156 +296,620 @@ def sign_in(email, password):
 
 def login_action(email, password, mode):
     session, message = (
-        sign_up(email, password) if mode == "Créer un compte"
+        sign_up(email, password)
+        if mode == "Créer un compte"
         else sign_in(email, password)
     )
+
     if not session:
         return (
-            None, f"**{message}**", gr.update(visible=True),
-            gr.update(visible=False), [], None, gr.update(choices=[], value=None),
-        )
-    if not session.get("user", {}).get("id"):
-        return (
-            None, "**Impossible de vérifier le compte utilisateur.**",
-            gr.update(visible=True), gr.update(visible=False), [], None,
+            None,
+            f"**{message}**",
+            gr.update(visible=True),
+            gr.update(visible=False),
+            [],
+            None,
             gr.update(choices=[], value=None),
         )
+
+    if not session.get("user", {}).get("id"):
+        return (
+            None,
+            "**Impossible de vérifier le compte utilisateur.**",
+            gr.update(visible=True),
+            gr.update(visible=False),
+            [],
+            None,
+            gr.update(choices=[], value=None),
+        )
+
     choices = get_conversation_choices(session)
+
     return (
-        session, f"**{message}**", gr.update(visible=False),
-        gr.update(visible=True), [], session["conversation_id"],
+        session,
+        f"**{message}**",
+        gr.update(visible=False),
+        gr.update(visible=True),
+        [],
+        session["conversation_id"],
         gr.update(choices=choices, value=None),
     )
 
 
 def logout_action():
     return (
-        None, "**Vous êtes déconnecté.**", gr.update(visible=True),
-        gr.update(visible=False), [], None, gr.update(choices=[], value=None),
+        None,
+        "**Vous êtes déconnecté.**",
+        gr.update(visible=True),
+        gr.update(visible=False),
+        [],
+        None,
+        gr.update(choices=[], value=None),
         "",
     )
 
 
 # =========================================================
-# 5. KNOWLEDGE BASE AND MEMORY
+# 5. MÉMOIRE PERSISTANTE
 # =========================================================
 
-def load_knowledge(question, access_token):
-    records = supabase_request(
-        "GET", "ayzora_knowledge", access_token,
-        params={"select": "title,content", "verified": "eq.true", "limit": "8"},
-    )
-    if not isinstance(records, list):
-        return ""
-    sections = []
-    for record in records:
-        title = str(record.get("title") or "").strip()
-        content = str(record.get("content") or "").strip()
-        if content:
-            sections.append(f"Titre : {title}\nContenu : {content[:4000]}")
-    return "\n\n".join(sections)[:MAX_TEXT_CHARS]
-
-
 def load_memories(access_token):
+    """
+    Charge les souvenirs accessibles au compte connecté.
+
+    La sécurité de l'isolation des comptes doit également être assurée
+    par les politiques RLS de Supabase.
+    """
+
     records = supabase_request(
-        "GET", "ayzora_memories", access_token,
+        "GET",
+        "ayzora_memories",
+        access_token,
         params={
-            "select": "id,category,title,content,updated_at",
-            "order": "updated_at.desc", "limit": "30",
+            "select": "id,user_id,category,title,content,created_at,updated_at",
+            "order": "updated_at.desc",
+            "limit": "100",
         },
     )
+
     return records if isinstance(records, list) else []
-
-
-def save_memory(access_token, category, title, content):
-    user = get_authenticated_user(access_token)
-    if not user or not user.get("id"):
-        return False
-    payload = {
-        "user_id": user["id"],
-        "category": str(category or "general")[:80],
-        "title": str(title or "")[:200],
-        "content": str(content or "")[:3000],
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
-    result = supabase_request(
-        "POST", "ayzora_memories", access_token,
-        payload=payload, prefer="return=minimal",
-    )
-    return result is not None
 
 
 def retrieve_memories_for_prompt(memories):
     sections = []
-    for memory in (memories or [])[:20]:
+
+    for memory in (memories or [])[:30]:
         title = str(memory.get("title") or "").strip()
         content = str(memory.get("content") or "").strip()
         category = str(memory.get("category") or "general").strip()
+
         if title and content:
-            sections.append(f"- Catégorie : {category}\n  Souvenir : {title}\n  Information : {content}")
-    return "\n".join(sections)[:12000]
+            sections.append(
+                f"- Catégorie : {category}\n"
+                f"  Titre : {title}\n"
+                f"  Information : {content}"
+            )
+
+    return "\n\n".join(sections)[:16000]
 
 
-def summarize_and_store_memories(access_token, user_text, assistant_text):
-    # Best-effort : une panne pendant l'extraction ne doit jamais annuler la réponse.
-    if not client or not user_text.strip():
-        return
-    prompt = f"""
-Extrais au maximum 3 informations durables explicitement données par l'utilisateur.
-N'infère aucun fait. N'enregistre aucun mot de passe, clé API, secret ou donnée sensible.
-Ne conserve pas les questions ponctuelles. Si rien n'est durable, renvoie [].
-Réponds uniquement en JSON sous forme de liste avec les clés category, title, content.
+def verify_memory_access(access_token):
+    user = get_authenticated_user(access_token)
 
-Message utilisateur :
-{user_text[:2500]}
+    if not user or not user.get("id"):
+        return None, "Session invalide. Reconnecte-toi."
 
-Réponse de l'assistant :
-{assistant_text[:1000]}
-"""
-    try:
-        result = generate_with_fallback(
-            prompt, temperature=0.1, max_output_tokens=800,
-            model_candidates=[GEMINI_MODEL] + FALLBACK_MODELS,
+    return user, ""
+
+
+def find_memory_by_title(access_token, title):
+    """
+    Recherche un souvenir par son titre exact.
+
+    La recherche est limitée aux souvenirs visibles par le compte connecté.
+    """
+
+    user, error = verify_memory_access(access_token)
+
+    if error:
+        return None
+
+    records = supabase_request(
+        "GET",
+        "ayzora_memories",
+        access_token,
+        params={
+            "select": "id,user_id,category,title,content,created_at,updated_at",
+            "user_id": f"eq.{user['id']}",
+            "title": f"eq.{title}",
+            "order": "updated_at.desc",
+            "limit": "1",
+        },
+    )
+
+    if isinstance(records, list) and records:
+        return records[0]
+
+    return None
+
+
+def save_memory(access_token, category, title, content):
+    """
+    Enregistre un souvenir.
+
+    Si un souvenir avec le même titre existe déjà pour l'utilisateur,
+    il est mis à jour. Sinon, un nouveau souvenir est créé.
+
+    Une réussite n'est retournée qu'après vérification de la base.
+    """
+
+    user, error = verify_memory_access(access_token)
+
+    if error:
+        print(error)
+        return False
+
+    title = str(title or "").strip()[:200]
+    content = str(content or "").strip()[:3000]
+    category = str(category or "general").strip()[:80]
+
+    if not title or not content:
+        return False
+
+    existing = find_memory_by_title(access_token, title)
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    if existing and existing.get("id"):
+        result = supabase_request(
+            "PATCH",
+            "ayzora_memories",
+            access_token,
+            params={
+                "id": f"eq.{existing['id']}",
+                "user_id": f"eq.{user['id']}",
+            },
+            payload={
+                "category": category,
+                "title": title,
+                "content": content,
+                "updated_at": now,
+            },
+            prefer="return=representation",
         )
-        raw = (result.text or "").strip()
-        if raw.startswith("```"):
-            raw = raw.replace("```json", "", 1).replace("```", "").strip()
-        start, end = raw.find("["), raw.rfind("]")
-        if start < 0 or end < start:
-            return
-        items = json.loads(raw[start:end + 1])
-        if not isinstance(items, list):
-            return
-        for item in items[:3]:
-            if isinstance(item, dict):
-                title = str(item.get("title") or "").strip()
-                content = str(item.get("content") or "").strip()
-                if title and content:
-                    save_memory(access_token, item.get("category", "general"), title, content)
-    except Exception as exc:
-        print("Extraction de mémoire ignorée :", repr(exc))
+
+        if result is None:
+            return False
+
+    else:
+        result = supabase_request(
+            "POST",
+            "ayzora_memories",
+            access_token,
+            payload={
+                "user_id": user["id"],
+                "category": category,
+                "title": title,
+                "content": content,
+                "updated_at": now,
+            },
+            prefer="return=representation",
+        )
+
+        if result is None:
+            return False
+
+    # Vérification réelle de la persistance.
+    saved = find_memory_by_title(access_token, title)
+
+    if not saved:
+        print("Vérification échouée : souvenir introuvable après sauvegarde.")
+        return False
+
+    if str(saved.get("content") or "").strip() != content:
+        print("Vérification échouée : le contenu enregistré est différent.")
+        return False
+
+    return True
+
+
+def update_memory(access_token, title, new_content, new_title=None):
+    """
+    Modifie un souvenir existant identifié par son titre exact.
+
+    Le filtre user_id empêche de cibler les souvenirs d'un autre compte.
+    """
+
+    user, error = verify_memory_access(access_token)
+
+    if error:
+        return False, error
+
+    title = str(title or "").strip()
+    new_content = str(new_content or "").strip()[:3000]
+
+    if not title or not new_content:
+        return False, "Le titre et le nouveau contenu sont obligatoires."
+
+    memory = find_memory_by_title(access_token, title)
+
+    if not memory or not memory.get("id"):
+        return False, (
+            f"Je n'ai trouvé aucun souvenir portant exactement le titre "
+            f"« {title} ». Aucun changement n'a été effectué."
+        )
+
+    payload = {
+        "content": new_content,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    if new_title and str(new_title).strip():
+        payload["title"] = str(new_title).strip()[:200]
+
+    result = supabase_request(
+        "PATCH",
+        "ayzora_memories",
+        access_token,
+        params={
+            "id": f"eq.{memory['id']}",
+            "user_id": f"eq.{user['id']}",
+        },
+        payload=payload,
+        prefer="return=representation",
+    )
+
+    if result is None:
+        return False, (
+            "Supabase a refusé la modification ou une erreur réseau "
+            "s'est produite. Vérifie les logs."
+        )
+
+    final_title = str(payload.get("title") or title).strip()
+    saved = find_memory_by_title(access_token, final_title)
+
+    if not saved:
+        return False, (
+            "La modification a été envoyée, mais je n'ai pas pu "
+            "la vérifier dans la base de données."
+        )
+
+    if str(saved.get("content") or "").strip() != new_content:
+        return False, (
+            "Le contenu retrouvé ne correspond pas à la valeur demandée. "
+            "Je ne peux pas confirmer la réussite."
+        )
+
+    return True, f"Le souvenir « {final_title} » a été modifié et vérifié."
+
+
+def delete_memory(access_token, title):
+    """
+    Supprime uniquement le souvenir ciblé par son titre exact.
+    """
+
+    user, error = verify_memory_access(access_token)
+
+    if error:
+        return False, error
+
+    title = str(title or "").strip()
+
+    if not title:
+        return False, "Le titre du souvenir à supprimer est obligatoire."
+
+    memory = find_memory_by_title(access_token, title)
+
+    if not memory or not memory.get("id"):
+        return False, f"Aucun souvenir intitulé « {title} » n'a été trouvé."
+
+    result = supabase_request(
+        "DELETE",
+        "ayzora_memories",
+        access_token,
+        params={
+            "id": f"eq.{memory['id']}",
+            "user_id": f"eq.{user['id']}",
+        },
+        prefer="return=representation",
+    )
+
+    if result is None:
+        return False, "La suppression a échoué. Consulte les logs Supabase."
+
+    # Vérification : le souvenir ciblé ne doit plus être présent.
+    remaining = supabase_request(
+        "GET",
+        "ayzora_memories",
+        access_token,
+        params={
+            "select": "id,title",
+            "id": f"eq.{memory['id']}",
+            "user_id": f"eq.{user['id']}",
+            "limit": "1",
+        },
+    )
+
+    if remaining is None:
+        return False, (
+            "La suppression a été envoyée, mais sa vérification a échoué."
+        )
+
+    if remaining:
+        return False, "Le souvenir est toujours présent après la tentative."
+
+    return True, f"Le souvenir « {title} » a été supprimé et vérifié."
 
 
 def refresh_memory(session):
     if not session or not session.get("access_token"):
         return "Connecte-toi pour consulter ta mémoire."
+
     memories = load_memories(session["access_token"])
+
     if not memories:
-        return "Aucun souvenir enregistré pour le moment. Tu peux demander à AYZORA de retenir une préférence ou une information durable."
-    return "\n\n---\n\n".join(
-        f"**{m.get('title', 'Souvenir')}**\n_Catégorie : {m.get('category', 'general')}_\n\n{m.get('content', '')}"
-        for m in memories
-    )
+        return (
+            "Aucun souvenir enregistré pour le moment. "
+            "Tu peux demander à AYZORA de retenir une information durable."
+        )
+
+    sections = []
+
+    for memory in memories:
+        sections.append(
+            f"**{memory.get('title', 'Souvenir')}**\n"
+            f"_Catégorie : {memory.get('category', 'general')}_\n\n"
+            f"{memory.get('content', '')}"
+        )
+
+    return "\n\n---\n\n".join(sections)
 
 
 # =========================================================
-# 6. CONVERSATION HISTORY
+# 6. COMMANDES DE MÉMOIRE
+# =========================================================
+
+def handle_memory_command(access_token, question):
+    """
+    Traite les demandes explicites de modification et de suppression.
+
+    Pour éviter les changements involontaires, une modification doit
+    indiquer clairement l'ancien titre et le nouveau contenu.
+
+    Retourne None si le message n'est pas une commande de mémoire.
+    """
+
+    text = (question or "").strip()
+    lower = text.lower()
+
+    update_words = (
+        "modifie ma mémoire",
+        "modifie le souvenir",
+        "mets à jour ma mémoire",
+        "mets a jour ma memoire",
+        "mets à jour le souvenir",
+        "remplace dans ma mémoire",
+        "remplace dans ma memoire",
+        "change le nom de mon projet",
+        "change le nom du projet",
+        "renomme le souvenir",
+    )
+
+    delete_words = (
+        "supprime ce souvenir",
+        "supprime le souvenir",
+        "supprime de ma mémoire",
+        "supprime de ma memoire",
+        "efface ce souvenir",
+        "efface le souvenir",
+    )
+
+    # -----------------------------------------------------
+    # Suppression explicite
+    # Format accepté : Supprime le souvenir intitulé : TITRE
+    # -----------------------------------------------------
+
+    if any(word in lower for word in delete_words):
+        match = re.search(
+            r"(?:intitulé|intitule|titre)\s*:\s*(.+)",
+            text,
+            flags=re.IGNORECASE,
+        )
+
+        if not match:
+            return (
+                "Pour éviter de supprimer le mauvais souvenir, précise "
+                "son titre exact.\n\n"
+                "Exemple : Supprime le souvenir intitulé : Nom du projet secret"
+            )
+
+        title = match.group(1).strip().strip("\"'“”")
+
+        success, message = delete_memory(access_token, title)
+
+        return message
+
+    # -----------------------------------------------------
+    # Modification explicite
+    # -----------------------------------------------------
+
+    if any(word in lower for word in update_words):
+        old_match = re.search(
+            r"(?:ancien titre|titre actuel|souvenir intitulé)\s*:\s*(.+)",
+            text,
+            flags=re.IGNORECASE,
+        )
+
+        new_content_match = re.search(
+            r"(?:nouveau contenu|nouvelle valeur|nouveau nom du projet secret)\s*:\s*(.+)",
+            text,
+            flags=re.IGNORECASE,
+        )
+
+        new_title_match = re.search(
+            r"(?:nouveau titre)\s*:\s*(.+)",
+            text,
+            flags=re.IGNORECASE,
+        )
+
+        # Prise en charge de la formulation habituelle :
+        # Ancien nom du projet secret : ...
+        # Nouveau nom du projet secret : ...
+        if not old_match:
+            old_match = re.search(
+                r"ancien nom du projet secret\s*:\s*(.+)",
+                text,
+                flags=re.IGNORECASE,
+            )
+
+        if not new_content_match:
+            new_content_match = re.search(
+                r"nouveau nom du projet secret\s*:\s*(.+)",
+                text,
+                flags=re.IGNORECASE,
+            )
+
+        if not old_match or not new_content_match:
+            return (
+                "Je peux modifier un souvenir, mais j'ai besoin "
+                "de son titre exact et de son nouveau contenu.\n\n"
+                "Utilise ce format :\n\n"
+                "Modifie ma mémoire persistante.\n"
+                "Ancien titre : Nom du projet secret\n"
+                "Nouveau contenu : Le nom du projet secret est EXEMPLE."
+            )
+
+        old_title = old_match.group(1).strip().strip("\"'“”")
+        new_content = new_content_match.group(1).strip().strip("\"'“”")
+
+        new_title = None
+
+        if new_title_match:
+            new_title = new_title_match.group(1).strip().strip("\"'“”")
+
+        success, message = update_memory(
+            access_token,
+            old_title,
+            new_content,
+            new_title=new_title,
+        )
+
+        return message
+
+    # -----------------------------------------------------
+    # Enregistrement explicite
+    # -----------------------------------------------------
+
+    save_words = (
+        "mémorise que",
+        "memorise que",
+        "souviens-toi que",
+        "souviens toi que",
+        "enregistre dans ta mémoire",
+        "enregistre dans ta memoire",
+        "retiens que",
+        "retient que",
+    )
+
+    if any(word in lower for word in save_words):
+        content = text
+
+        for word in save_words:
+            index = lower.find(word)
+
+            if index >= 0:
+                content = text[index + len(word):].strip(" :,-")
+                break
+
+        if not content:
+            return (
+                "Précise l'information que tu souhaites enregistrer."
+            )
+
+        # Ce traitement n'enregistre pas les secrets techniques.
+        sensitive_terms = (
+            "mot de passe",
+            "password",
+            "clé api",
+            "cle api",
+            "api_key",
+            "access_token",
+            "secret key",
+        )
+
+        if any(term in content.lower() for term in sensitive_terms):
+            return (
+                "Je ne peux pas enregistrer de mot de passe, de clé API "
+                "ou de jeton d'accès dans la mémoire personnelle."
+            )
+
+        title = "Information retenue"
+
+        success = save_memory(
+            access_token,
+            "information_utilisateur",
+            title,
+            content,
+        )
+
+        if success:
+            return (
+                "J'ai enregistré et vérifié cette information "
+                "dans ta mémoire persistante."
+            )
+
+        return (
+            "Je n'ai pas pu vérifier l'enregistrement dans Supabase. "
+            "Je ne peux donc pas confirmer que cette information "
+            "a été sauvegardée."
+        )
+
+    return None
+
+
+# =========================================================
+# 7. BASE DE CONNAISSANCES
+# =========================================================
+
+def load_knowledge(question, access_token):
+    records = supabase_request(
+        "GET",
+        "ayzora_knowledge",
+        access_token,
+        params={
+            "select": "title,content",
+            "verified": "eq.true",
+            "limit": "8",
+        },
+    )
+
+    if not isinstance(records, list):
+        return ""
+
+    sections = []
+
+    for record in records:
+        title = str(record.get("title") or "").strip()
+        content = str(record.get("content") or "").strip()
+
+        if content:
+            sections.append(
+                f"Titre : {title}\nContenu : {content[:4000]}"
+            )
+
+    return "\n\n".join(sections)[:MAX_TEXT_CHARS]
+
+
+# =========================================================
+# 8. HISTORIQUE DES CONVERSATIONS
 # =========================================================
 
 def save_conversation(access_token, conversation_id, messages, title=None):
     user = get_authenticated_user(access_token)
+
     if not user or not user.get("id"):
         return False
+
     payload = {
         "id": conversation_id,
         "user_id": user["id"],
@@ -358,162 +917,326 @@ def save_conversation(access_token, conversation_id, messages, title=None):
         "messages": messages[-80:],
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
+
     result = supabase_request(
-        "POST", "ayzora_conversations", access_token,
-        params={"on_conflict": "id"}, payload=payload,
+        "POST",
+        "ayzora_conversations",
+        access_token,
+        params={"on_conflict": "id"},
+        payload=payload,
         prefer="resolution=merge-duplicates,return=minimal",
     )
+
     return result is not None
 
 
 def get_conversation_choices(session):
     if not session or not session.get("access_token"):
         return []
+
     records = supabase_request(
-        "GET", "ayzora_conversations", session["access_token"],
+        "GET",
+        "ayzora_conversations",
+        session["access_token"],
         params={
             "select": "id,title,updated_at",
-            "order": "updated_at.desc", "limit": "50",
+            "order": "updated_at.desc",
+            "limit": "50",
         },
     )
+
     if not isinstance(records, list):
         return []
+
     return [
-        (f"{r.get('title') or 'Conversation'} — {str(r.get('updated_at') or '')[:16]}", r["id"])
-        for r in records if r.get("id")
+        (
+            f"{r.get('title') or 'Conversation'} — "
+            f"{str(r.get('updated_at') or '')[:16]}",
+            r["id"],
+        )
+        for r in records
+        if r.get("id")
     ]
 
 
 def refresh_conversation_choices(session):
-    return gr.update(choices=get_conversation_choices(session), value=None)
+    return gr.update(
+        choices=get_conversation_choices(session),
+        value=None,
+    )
 
 
 def load_conversation(session, conversation_id):
     if not session or not session.get("access_token"):
         return [], None, "Connecte-toi pour ouvrir une conversation."
+
     if not conversation_id:
         return [], None, "Choisis une conversation dans la liste."
+
+    user = get_authenticated_user(session["access_token"])
+
+    if not user:
+        return [], None, "Session invalide. Reconnecte-toi."
+
     records = supabase_request(
-        "GET", "ayzora_conversations", session["access_token"],
+        "GET",
+        "ayzora_conversations",
+        session["access_token"],
         params={
             "select": "id,title,messages",
-            "id": f"eq.{conversation_id}", "limit": "1",
+            "id": f"eq.{conversation_id}",
+            "user_id": f"eq.{user['id']}",
+            "limit": "1",
         },
     )
+
     if not isinstance(records, list) or not records:
         return [], None, "Conversation introuvable."
+
     record = records[0]
     messages = record.get("messages") or []
+
     if not isinstance(messages, list):
         messages = []
-    # Ne conserver que le format messages accepté par Gradio Chatbot.
+
     cleaned = []
+
     for item in messages:
-        if isinstance(item, dict) and item.get("role") in ("user", "assistant"):
+        if (
+            isinstance(item, dict)
+            and item.get("role") in ("user", "assistant")
+        ):
             content = item.get("content", "")
+
             if isinstance(content, str):
-                cleaned.append({"role": item["role"], "content": content})
-    return cleaned, record.get("id"), f"Conversation ouverte : **{record.get('title') or 'Conversation'}**"
+                cleaned.append({
+                    "role": item["role"],
+                    "content": content,
+                })
+
+    return (
+        cleaned,
+        record.get("id"),
+        f"Conversation ouverte : **{record.get('title') or 'Conversation'}**",
+    )
 
 
 def new_conversation(session):
     new_id = str(uuid.uuid4())
+
     if session:
         session["conversation_id"] = new_id
+
     return [], new_id, "Nouvelle conversation prête."
 
 
 # =========================================================
-# 7. FILE TEXT EXTRACTION
+# 9. EXTRACTION DU TEXTE DES FICHIERS
 # =========================================================
 
 def extract_document_text(file_path):
     path = Path(file_path)
     extension = path.suffix.lower()
+
     if not path.exists():
         return "[Fichier introuvable]"
+
     if path.stat().st_size > MAX_FILE_SIZE:
         return f"[Le fichier {path.name} dépasse la limite de 15 Mo.]"
+
     try:
         if extension == ".pdf":
             from pypdf import PdfReader
+
             reader = PdfReader(str(path))
-            return "\n".join(page.extract_text() or "" for page in reader.pages[:40])[:MAX_TEXT_CHARS]
+
+            return "\n".join(
+                page.extract_text() or ""
+                for page in reader.pages[:40]
+            )[:MAX_TEXT_CHARS]
+
         if extension == ".docx":
             from docx import Document
+
             doc = Document(str(path))
-            return "\n".join(p.text for p in doc.paragraphs if p.text.strip())[:MAX_TEXT_CHARS]
+
+            return "\n".join(
+                p.text for p in doc.paragraphs if p.text.strip()
+            )[:MAX_TEXT_CHARS]
+
         if extension in {".txt", ".md", ".log"}:
-            return path.read_text(encoding="utf-8", errors="replace")[:MAX_TEXT_CHARS]
+            return path.read_text(
+                encoding="utf-8",
+                errors="replace",
+            )[:MAX_TEXT_CHARS]
+
         if extension == ".json":
-            with path.open("r", encoding="utf-8", errors="replace") as f:
-                data = json.load(f)
-            return json.dumps(data, ensure_ascii=False, indent=2)[:MAX_TEXT_CHARS]
+            with path.open(
+                "r",
+                encoding="utf-8",
+                errors="replace",
+            ) as file:
+                data = json.load(file)
+
+            return json.dumps(
+                data,
+                ensure_ascii=False,
+                indent=2,
+            )[:MAX_TEXT_CHARS]
+
         if extension == ".csv":
-            with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as f:
-                rows = list(csv.reader(f))
-            return "\n".join(" | ".join(row) for row in rows[:300])[:MAX_TEXT_CHARS]
+            with path.open(
+                "r",
+                encoding="utf-8-sig",
+                errors="replace",
+                newline="",
+            ) as file:
+                rows = list(csv.reader(file))
+
+            return "\n".join(
+                " | ".join(row) for row in rows[:300]
+            )[:MAX_TEXT_CHARS]
+
         if extension in {".xlsx", ".xlsm"}:
             from openpyxl import load_workbook
-            workbook = load_workbook(str(path), read_only=True, data_only=True)
+
+            workbook = load_workbook(
+                str(path),
+                read_only=True,
+                data_only=True,
+            )
+
             sections = []
             total = 0
+
             try:
                 for sheet in workbook.worksheets:
                     sections.append(f"\nFeuille : {sheet.title}")
-                    for row in sheet.iter_rows(min_row=1, max_row=150, values_only=True):
-                        line = " | ".join("" if v is None else str(v) for v in row)
+
+                    for row in sheet.iter_rows(
+                        min_row=1,
+                        max_row=150,
+                        values_only=True,
+                    ):
+                        line = " | ".join(
+                            "" if value is None else str(value)
+                            for value in row
+                        )
+
                         sections.append(line)
                         total += len(line)
+
                         if total >= MAX_TEXT_CHARS:
                             break
+
                     if total >= MAX_TEXT_CHARS:
                         break
+
             finally:
                 workbook.close()
+
             return "\n".join(sections)[:MAX_TEXT_CHARS]
-        return f"[Le format {extension} n'est pas pris en charge pour l'extraction de texte.]"
+
+        return (
+            f"[Le format {extension} n'est pas pris en charge "
+            "pour l'extraction de texte.]"
+        )
+
     except Exception as exc:
-        print(f"Erreur de lecture du fichier {path.name} :", repr(exc))
+        print(
+            f"Erreur de lecture du fichier {path.name} :",
+            repr(exc),
+        )
+
         return f"[Impossible de lire le fichier {path.name}.]"
 
 
 def prepare_file_parts(file_paths):
     parts = []
+
     for file_path in file_paths or []:
         if not file_path:
             continue
+
         path = Path(file_path)
+
         if not path.exists():
-            parts.append(types.Part.from_text(text=f"Fichier introuvable : {path.name}"))
+            parts.append(
+                types.Part.from_text(
+                    text=f"Fichier introuvable : {path.name}"
+                )
+            )
             continue
+
         if path.stat().st_size > MAX_FILE_SIZE:
-            parts.append(types.Part.from_text(text=f"Fichier trop volumineux : {path.name}"))
+            parts.append(
+                types.Part.from_text(
+                    text=f"Fichier trop volumineux : {path.name}"
+                )
+            )
             continue
-        if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
-            mime_type = mimetypes.guess_type(str(path))[0] or "image/jpeg"
-            parts.append(types.Part.from_text(text=f"Image fournie : {path.name}"))
-            parts.append(types.Part.from_bytes(data=path.read_bytes(), mime_type=mime_type))
+
+        if path.suffix.lower() in {
+            ".png", ".jpg", ".jpeg", ".webp"
+        }:
+            mime_type = (
+                mimetypes.guess_type(str(path))[0]
+                or "image/jpeg"
+            )
+
+            parts.append(
+                types.Part.from_text(
+                    text=f"Image fournie : {path.name}"
+                )
+            )
+
+            parts.append(
+                types.Part.from_bytes(
+                    data=path.read_bytes(),
+                    mime_type=mime_type,
+                )
+            )
+
         else:
-            parts.append(types.Part.from_text(
-                text=f"Document : {path.name}\nContenu extrait :\n{extract_document_text(path)}"
-            ))
+            parts.append(
+                types.Part.from_text(
+                    text=(
+                        f"Document : {path.name}\n"
+                        f"Contenu extrait :\n"
+                        f"{extract_document_text(path)}"
+                    )
+                )
+            )
+
     return parts
 
 
 # =========================================================
-# 8. GEMINI RETRIES AND MODEL FALLBACK
+# 10. GEMINI : NOUVELLES TENTATIVES ET MODÈLES DE SECOURS
 # =========================================================
 
-def generate_with_fallback(contents, temperature=0.4, max_output_tokens=4096, model_candidates=None):
+def generate_with_fallback(
+    contents,
+    temperature=0.4,
+    max_output_tokens=4096,
+    model_candidates=None,
+):
     if not client:
-        raise RuntimeError("La clé GEMINI_API_KEY n'est pas configurée.")
+        raise RuntimeError(
+            "La clé GEMINI_API_KEY n'est pas configurée."
+        )
+
     candidates = model_candidates or MODEL_CANDIDATES
     errors = []
+
     for model_name in list(dict.fromkeys(candidates)):
         for attempt in range(GEMINI_RETRIES):
             try:
-                print(f"Appel Gemini : modèle={model_name}, tentative={attempt + 1}")
+                print(
+                    f"Appel Gemini : modèle={model_name}, "
+                    f"tentative={attempt + 1}"
+                )
+
                 return client.models.generate_content(
                     model=model_name,
                     contents=contents,
@@ -522,36 +1245,185 @@ def generate_with_fallback(contents, temperature=0.4, max_output_tokens=4096, mo
                         max_output_tokens=max_output_tokens,
                     ),
                 )
+
             except Exception as exc:
-                errors.append(f"{model_name}: {type(exc).__name__}: {str(exc)[:180]}")
-                text = str(exc).lower()
-                retryable = any(code in text for code in (
-                    "503", "unavailable", "429", "resource_exhausted",
-                    "500", "internal", "502", "504", "deadline",
-                    "timed out", "timeout",
-                ))
-                print(f"Échec Gemini {model_name} tentative {attempt + 1} :", repr(exc))
+                errors.append(
+                    f"{model_name}: {type(exc).__name__}: "
+                    f"{str(exc)[:180]}"
+                )
+
+                error_text = str(exc).lower()
+
+                retryable = any(
+                    code in error_text
+                    for code in (
+                        "503",
+                        "unavailable",
+                        "429",
+                        "resource_exhausted",
+                        "500",
+                        "internal",
+                        "502",
+                        "504",
+                        "deadline",
+                        "timed out",
+                        "timeout",
+                    )
+                )
+
+                print(
+                    f"Échec Gemini {model_name} "
+                    f"tentative {attempt + 1} :",
+                    repr(exc),
+                )
+
                 if not retryable:
-                    # Une erreur de modèle peut justifier le passage au modèle suivant.
-                    if any(term in text for term in ("not found", "unsupported", "model")):
+                    if any(
+                        term in error_text
+                        for term in (
+                            "not found",
+                            "unsupported",
+                            "model",
+                        )
+                    ):
                         break
+
                     raise
+
                 if attempt < GEMINI_RETRIES - 1:
                     time.sleep(1.5 * (2 ** attempt))
                 else:
                     break
-    raise RuntimeError("Tous les modèles Gemini ont échoué. " + " | ".join(errors[-6:]))
+
+    raise RuntimeError(
+        "Tous les modèles Gemini ont échoué. "
+        + " | ".join(errors[-6:])
+    )
 
 
 # =========================================================
-# 9. CHAT
+# 11. EXTRACTION FACULTATIVE DE SOUVENIRS
+# =========================================================
+
+def summarize_and_store_memories(
+    access_token,
+    user_text,
+    assistant_text,
+):
+    """
+    Extrait des informations durables.
+
+    La sauvegarde passe par save_memory, qui met à jour un souvenir
+    portant le même titre au lieu de toujours créer un doublon.
+    """
+
+    if not client or not user_text.strip():
+        return
+
+    prompt = f"""
+Extrais au maximum 3 informations durables explicitement données
+par l'utilisateur.
+
+N'infère aucun fait.
+N'enregistre aucun mot de passe, clé API, jeton ou secret technique.
+Ne conserve pas les questions ponctuelles.
+
+Si rien n'est durable, renvoie [].
+
+Réponds uniquement en JSON sous forme de liste avec les clés :
+category, title, content.
+
+Message utilisateur :
+{user_text[:2500]}
+
+Réponse de l'assistant :
+{assistant_text[:1000]}
+"""
+
+    try:
+        result = generate_with_fallback(
+            prompt,
+            temperature=0.1,
+            max_output_tokens=800,
+            model_candidates=MODEL_CANDIDATES,
+        )
+
+        raw = (result.text or "").strip()
+
+        if raw.startswith("```"):
+            raw = raw.replace("```json", "", 1)
+            raw = raw.replace("```", "").strip()
+
+        start = raw.find("[")
+        end = raw.rfind("]")
+
+        if start < 0 or end < start:
+            return
+
+        items = json.loads(raw[start:end + 1])
+
+        if not isinstance(items, list):
+            return
+
+        for item in items[:3]:
+            if not isinstance(item, dict):
+                continue
+
+            title = str(item.get("title") or "").strip()
+            content = str(item.get("content") or "").strip()
+            category = str(item.get("category") or "general")
+
+            if not title or not content:
+                continue
+
+            sensitive_terms = (
+                "mot de passe",
+                "password",
+                "clé api",
+                "cle api",
+                "api_key",
+                "access_token",
+                "secret key",
+            )
+
+            if any(
+                term in (title + " " + content).lower()
+                for term in sensitive_terms
+            ):
+                continue
+
+            success = save_memory(
+                access_token,
+                category,
+                title,
+                content,
+            )
+
+            if not success:
+                print(
+                    "Un souvenir extrait n'a pas pu être vérifié :",
+                    title,
+                )
+
+    except Exception as exc:
+        print(
+            "Extraction de mémoire ignorée :",
+            repr(exc),
+        )
+
+
+# =========================================================
+# 12. CHAT PRINCIPAL
 # =========================================================
 
 def chat(message, history, session, conversation_id):
     if not session or not session.get("access_token"):
         return "Connecte-toi pour utiliser AYZORA AI."
+
     if not client:
-        return "La clé GEMINI_API_KEY n'est pas configurée sur Render."
+        return (
+            "La clé GEMINI_API_KEY n'est pas configurée sur Render."
+        )
 
     if isinstance(message, dict):
         question = str(message.get("text") or "").strip()
@@ -559,85 +1431,197 @@ def chat(message, history, session, conversation_id):
     else:
         question = str(message or "").strip()
         file_paths = []
+
     if isinstance(file_paths, str):
         file_paths = [file_paths]
+
     if not question and not file_paths:
         return "Écris une question ou joins un fichier."
 
     token = session["access_token"]
+
     try:
         user = get_authenticated_user(token)
-        if not user:
-            return "Ta session a expiré. Déconnecte-toi, puis reconnecte-toi."
 
+        if not user:
+            return (
+                "Ta session a expiré. Déconnecte-toi, "
+                "puis reconnecte-toi."
+            )
+
+        # 1. Les commandes de mémoire sont traitées côté Python.
+        # Gemini ne doit pas simplement prétendre effectuer une écriture.
+        if question:
+            memory_command_result = handle_memory_command(
+                token,
+                question,
+            )
+
+            if memory_command_result is not None:
+                return memory_command_result
+
+        # 2. Chargement des souvenirs du compte.
         memories = load_memories(token)
         memory_text = retrieve_memories_for_prompt(memories)
+
+        # 3. Chargement de la base de connaissances.
         knowledge = load_knowledge(question, token)
 
+        # 4. Construction de l'historique.
         contents = []
+
         for item in (history or [])[-12:]:
             if not isinstance(item, dict):
                 continue
+
             role = item.get("role")
             content = item.get("content")
-            # L'historique de ChatInterface peut contenir des objets fichiers/images.
-            if role in {"user", "assistant"} and isinstance(content, str) and content.strip():
-                contents.append(types.Content(
-                    role="user" if role == "user" else "model",
-                    parts=[types.Part.from_text(text=content)],
-                ))
 
-        prompt_parts = [types.Part.from_text(text=SYSTEM_INSTRUCTION)]
+            if (
+                role in {"user", "assistant"}
+                and isinstance(content, str)
+                and content.strip()
+            ):
+                contents.append(
+                    types.Content(
+                        role="user" if role == "user" else "model",
+                        parts=[
+                            types.Part.from_text(text=content)
+                        ],
+                    )
+                )
+
+        # 5. Construction du message envoyé à Gemini.
+        prompt_parts = [
+            types.Part.from_text(
+                text=SYSTEM_INSTRUCTION
+            )
+        ]
+
         if memory_text:
-            prompt_parts.append(types.Part.from_text(
-                text="MÉMOIRE PERSISTANTE DE CET UTILISATEUR :\n"
-                     f"{memory_text}\nUtilise-la seulement si elle est pertinente."
-            ))
+            prompt_parts.append(
+                types.Part.from_text(
+                    text=(
+                        "MÉMOIRE PERSISTANTE DE L'UTILISATEUR "
+                        "ACTUELLEMENT CONNECTÉ :\n"
+                        f"{memory_text}\n\n"
+                        "Utilise ces informations avec prudence. "
+                        "Ne confonds pas les souvenirs distincts."
+                    )
+                )
+            )
+
         if knowledge:
-            prompt_parts.append(types.Part.from_text(
-                text="BASE DE CONNAISSANCES VÉRIFIÉE :\n" + knowledge
-            ))
-        prompt_parts.append(types.Part.from_text(
-            text="MESSAGE DE L'UTILISATEUR :\n" + (question or "Analyse les fichiers joints.")
-        ))
-        prompt_parts.extend(prepare_file_parts(file_paths))
-        contents.append(types.Content(role="user", parts=prompt_parts))
+            prompt_parts.append(
+                types.Part.from_text(
+                    text=(
+                        "BASE DE CONNAISSANCES VÉRIFIÉE :\n"
+                        + knowledge
+                    )
+                )
+            )
 
+        prompt_parts.append(
+            types.Part.from_text(
+                text=(
+                    "MESSAGE DE L'UTILISATEUR :\n"
+                    + (
+                        question
+                        or "Analyse les fichiers joints."
+                    )
+                )
+            )
+        )
+
+        prompt_parts.extend(
+            prepare_file_parts(file_paths)
+        )
+
+        contents.append(
+            types.Content(
+                role="user",
+                parts=prompt_parts,
+            )
+        )
+
+        # 6. Génération de la réponse.
         response = generate_with_fallback(contents)
+
         answer = (response.text or "").strip()
+
         if not answer:
-            answer = "Je n'ai pas reçu de réponse textuelle. Essaie de reformuler ta question."
+            answer = (
+                "Je n'ai pas reçu de réponse textuelle. "
+                "Essaie de reformuler ta question."
+            )
 
-        # Persistance de la conversation.
+        # 7. Sauvegarde de la conversation.
         current_history = list(history or [])
-        current_history.extend([
-            {"role": "user", "content": question or "[Fichier joint]"},
-            {"role": "assistant", "content": answer},
-        ])
-        if not conversation_id:
-            conversation_id = session.get("conversation_id") or str(uuid.uuid4())
-        session["conversation_id"] = conversation_id
-        title = question or "Analyse de fichier"
-        if not save_conversation(token, conversation_id, current_history, title=title[:100]):
-            print("Attention : la conversation n'a pas été sauvegardée.")
 
-        # Extraction de mémoire facultative. Ne doit pas modifier la réponse déjà générée.
+        current_history.extend([
+            {
+                "role": "user",
+                "content": question or "[Fichier joint]",
+            },
+            {
+                "role": "assistant",
+                "content": answer,
+            },
+        ])
+
+        if not conversation_id:
+            conversation_id = (
+                session.get("conversation_id")
+                or str(uuid.uuid4())
+            )
+
+        session["conversation_id"] = conversation_id
+
+        title = question or "Analyse de fichier"
+
+        if not save_conversation(
+            token,
+            conversation_id,
+            current_history,
+            title=title[:100],
+        ):
+            print(
+                "Attention : la conversation n'a pas été sauvegardée."
+            )
+
+        # 8. Extraction facultative de nouveaux souvenirs.
+        # Les commandes explicites sont traitées plus haut.
         if question:
-            summarize_and_store_memories(token, question, answer)
+            summarize_and_store_memories(
+                token,
+                question,
+                answer,
+            )
 
         return answer
 
     except Exception as exc:
         print("ERREUR AYZORA AI :", repr(exc))
         traceback.print_exc()
+
         error_text = str(exc).lower()
+
         if "503" in error_text or "unavailable" in error_text:
             return (
-                "Gemini est temporairement indisponible, même après les tentatives "
-                "et modèles de secours. Attends un peu puis réessaie."
+                "Gemini est temporairement indisponible, même après "
+                "les tentatives et modèles de secours. "
+                "Attends un peu puis réessaie."
             )
-        if "429" in error_text or "resource_exhausted" in error_text:
-            return "La limite de requêtes Gemini a été atteinte. Attends avant de réessayer."
+
+        if (
+            "429" in error_text
+            or "resource_exhausted" in error_text
+        ):
+            return (
+                "La limite de requêtes Gemini a été atteinte. "
+                "Attends avant de réessayer."
+            )
+
         return (
             f"Une erreur est survenue ({type(exc).__name__}). "
             "Consulte les logs Render pour le détail."
@@ -645,22 +1629,28 @@ def chat(message, history, session, conversation_id):
 
 
 # =========================================================
-# 10. INTERFACE
+# 13. INTERFACE GRADIO
 # =========================================================
 
 DESCRIPTION = """
 ### Bienvenue sur AYZORA AI
 
 Ton assistant intelligent pour :
-- répondre à tes questions et t'aider à apprendre ;
-- rédiger des contenus et préparer des stratégies ;
-- analyser des images et des documents ;
-- t'accompagner dans tes projets professionnels et techniques.
 
-Connecte-toi pour accéder à tes conversations et à ta mémoire personnelle.
+- Répondre à tes questions et t'aider à apprendre.
+- Rédiger des contenus et préparer des stratégies.
+- Analyser des images et des documents.
+- T'accompagner dans tes projets professionnels et techniques.
+- Conserver des souvenirs dans ta mémoire personnelle.
+
+Connecte-toi pour accéder à tes conversations et à ta mémoire.
 """
 
-with gr.Blocks(theme=gr.themes.Soft(), title="AYZORA AI") as demo:
+with gr.Blocks(
+    theme=gr.themes.Soft(),
+    title="AYZORA AI",
+) as demo:
+
     session_state = gr.State(None)
     conversation_state = gr.State(None)
 
@@ -669,21 +1659,49 @@ with gr.Blocks(theme=gr.themes.Soft(), title="AYZORA AI") as demo:
 
     with gr.Column(visible=True) as auth_panel:
         gr.Markdown("## Connexion / inscription")
+
         mode = gr.Radio(
             ["Se connecter", "Créer un compte"],
-            value="Se connecter", label="Action",
+            value="Se connecter",
+            label="Action",
         )
-        email = gr.Textbox(label="Adresse e-mail", placeholder="vous@exemple.com")
-        password = gr.Textbox(label="Mot de passe (12 caractères minimum)", type="password")
-        auth_button = gr.Button("Continuer", variant="primary")
-        auth_status = gr.Markdown("Les nouveaux comptes peuvent nécessiter une confirmation par e-mail.")
+
+        email = gr.Textbox(
+            label="Adresse e-mail",
+            placeholder="vous@exemple.com",
+        )
+
+        password = gr.Textbox(
+            label="Mot de passe (12 caractères minimum)",
+            type="password",
+        )
+
+        auth_button = gr.Button(
+            "Continuer",
+            variant="primary",
+        )
+
+        auth_status = gr.Markdown(
+            "Les nouveaux comptes peuvent nécessiter "
+            "une confirmation par e-mail."
+        )
 
     with gr.Column(visible=False) as app_panel:
         login_status = gr.Markdown()
+
         with gr.Row():
-            new_chat_button = gr.Button("➕ Nouvelle conversation", variant="primary")
-            memory_button = gr.Button("🧠 Voir ma mémoire")
-            logout_button = gr.Button("Se déconnecter")
+            new_chat_button = gr.Button(
+                "➕ Nouvelle conversation",
+                variant="primary",
+            )
+
+            memory_button = gr.Button(
+                "🧠 Voir ma mémoire"
+            )
+
+            logout_button = gr.Button(
+                "Se déconnecter"
+            )
 
         with gr.Row():
             conversation_picker = gr.Dropdown(
@@ -693,8 +1711,14 @@ with gr.Blocks(theme=gr.themes.Soft(), title="AYZORA AI") as demo:
                 interactive=True,
                 scale=4,
             )
-            refresh_history_button = gr.Button("↻ Actualiser")
-            open_history_button = gr.Button("Ouvrir")
+
+            refresh_history_button = gr.Button(
+                "↻ Actualiser"
+            )
+
+            open_history_button = gr.Button(
+                "Ouvrir"
+            )
 
         history_status = gr.Markdown()
         memory_view = gr.Markdown()
@@ -703,67 +1727,147 @@ with gr.Blocks(theme=gr.themes.Soft(), title="AYZORA AI") as demo:
             fn=chat,
             type="messages",
             multimodal=True,
+
             chatbot=gr.Chatbot(
                 type="messages",
                 height=500,
                 placeholder="Pose ta question à AYZORA AI...",
             ),
+
             textbox=gr.MultimodalTextbox(
                 placeholder="Écris ta question ou joins un fichier...",
                 file_count="multiple",
                 file_types=[
-                    ".pdf", ".docx", ".txt", ".md", ".log", ".json", ".csv",
-                    ".xlsx", ".xlsm", ".png", ".jpg", ".jpeg", ".webp",
+                    ".pdf",
+                    ".docx",
+                    ".txt",
+                    ".md",
+                    ".log",
+                    ".json",
+                    ".csv",
+                    ".xlsx",
+                    ".xlsm",
+                    ".png",
+                    ".jpg",
+                    ".jpeg",
+                    ".webp",
                 ],
                 sources=["upload"],
             ),
-            additional_inputs=[session_state, conversation_state],
-            examples=[
-                ["Présente-toi et explique-moi tes capacités.", None, None],
-                ["Aide-moi à préparer une stratégie marketing digital.", None, None],
-                ["Explique-moi simplement ce qu'est un agent IA.", None, None],
-                ["Je souhaite que tu retiennes que mon objectif est de développer AYZORA AI.", None, None],
+
+            additional_inputs=[
+                session_state,
+                conversation_state,
             ],
+
+            examples=[
+                [
+                    "Présente-toi et explique-moi tes capacités.",
+                    None,
+                    None,
+                ],
+                [
+                    "Aide-moi à préparer une stratégie marketing digital.",
+                    None,
+                    None,
+                ],
+                [
+                    "Explique-moi simplement ce qu'est un agent IA.",
+                    None,
+                    None,
+                ],
+                [
+                    "Je souhaite que tu retiennes que mon objectif "
+                    "est de développer AYZORA AI.",
+                    None,
+                    None,
+                ],
+            ],
+
             save_history=False,
         )
 
     auth_button.click(
         fn=login_action,
-        inputs=[email, password, mode],
+        inputs=[
+            email,
+            password,
+            mode,
+        ],
         outputs=[
-            session_state, auth_status, auth_panel, app_panel,
-            chatbot.chatbot, conversation_state, conversation_picker,
+            session_state,
+            auth_status,
+            auth_panel,
+            app_panel,
+            chatbot.chatbot,
+            conversation_state,
+            conversation_picker,
         ],
     )
+
     logout_button.click(
         fn=logout_action,
         inputs=[],
         outputs=[
-            session_state, auth_status, auth_panel, app_panel,
-            chatbot.chatbot, conversation_state, conversation_picker, memory_view,
+            session_state,
+            auth_status,
+            auth_panel,
+            app_panel,
+            chatbot.chatbot,
+            conversation_state,
+            conversation_picker,
+            memory_view,
         ],
     )
+
     memory_button.click(
-        fn=refresh_memory, inputs=[session_state], outputs=[memory_view],
+        fn=refresh_memory,
+        inputs=[session_state],
+        outputs=[memory_view],
     )
+
     refresh_history_button.click(
         fn=refresh_conversation_choices,
-        inputs=[session_state], outputs=[conversation_picker],
+        inputs=[session_state],
+        outputs=[conversation_picker],
     )
+
     open_history_button.click(
         fn=load_conversation,
-        inputs=[session_state, conversation_picker],
-        outputs=[chatbot.chatbot, conversation_state, history_status],
+        inputs=[
+            session_state,
+            conversation_picker,
+        ],
+        outputs=[
+            chatbot.chatbot,
+            conversation_state,
+            history_status,
+        ],
     )
+
     new_chat_button.click(
         fn=new_conversation,
         inputs=[session_state],
-        outputs=[chatbot.chatbot, conversation_state, history_status],
+        outputs=[
+            chatbot.chatbot,
+            conversation_state,
+            history_status,
+        ],
     )
 
-    gr.Markdown("---\nAYZORA AI · Assistant intelligent")
+    gr.Markdown(
+        "---\nAYZORA AI · Assistant intelligent"
+    )
 
+
+# =========================================================
+# 14. DÉMARRAGE
+# =========================================================
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "7860"))
-    demo.launch(server_name="0.0.0.0", server_port=port)
+
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=port,
+    )
