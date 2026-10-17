@@ -313,10 +313,14 @@ def load_knowledge(question, access_token):
 
 
 # =========================================================
-# 6. MÉMOIRE PERSISTANTE
+# MÉMOIRE PERSISTANTE AYZORA AI — VERSION CORRIGÉE
 # =========================================================
 
 def load_memories(access_token):
+    """Charge uniquement les souvenirs accessibles à l'utilisateur connecté."""
+    if not access_token:
+        return []
+
     memories = supabase_request(
         "GET",
         "ayzora_memories",
@@ -324,25 +328,40 @@ def load_memories(access_token):
         params={
             "select": "id,category,title,content,updated_at",
             "order": "updated_at.desc",
-            "limit": "30",
+            "limit": "50",
         },
     )
+
+    if memories is None:
+        print("ERREUR : impossible de lire la mémoire Supabase.")
+        return []
 
     return memories if isinstance(memories, list) else []
 
 
 def save_memory(access_token, category, title, content):
+    """Enregistre un souvenir et vérifie qu'il est réellement sauvegardé."""
+    if not access_token:
+        return False
+
+    title = str(title or "").strip()
+    content = str(content or "").strip()
+    category = str(category or "general").strip()
+
+    if not title or not content:
+        return False
+
     user = get_authenticated_user(access_token)
 
     if not user or not user.get("id"):
-        print("Mémoire non sauvegardée : utilisateur non authentifié.")
+        print("ERREUR : utilisateur non authentifié.")
         return False
 
     payload = {
         "user_id": user["id"],
-        "category": str(category or "general")[:80],
-        "title": str(title or "")[:200],
-        "content": str(content or "")[:3000],
+        "category": category[:80],
+        "title": title[:200],
+        "content": content[:3000],
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -351,32 +370,166 @@ def save_memory(access_token, category, title, content):
         "ayzora_memories",
         access_token,
         payload=payload,
-        prefer="return=minimal",
+        prefer="return=representation",
     )
 
-    return result is not None
+    if result is None:
+        print("ÉCHEC : Supabase n'a pas confirmé la sauvegarde.")
+        return False
+
+    # Vérifie que le souvenir existe après l'écriture.
+    memories = load_memories(access_token)
+
+    for memory in memories:
+        if (
+            memory.get("title") == title
+            and memory.get("content") == content
+            and memory.get("user_id", user["id"]) == user["id"]
+        ):
+            print(f"MÉMOIRE CONFIRMÉE : {title}")
+            return True
+
+    # Certaines configurations REST ne renvoient pas la ligne créée.
+    # On ne prétend donc pas que la vérification a réussi.
+    print(
+        "AVERTISSEMENT : écriture envoyée, "
+        "mais souvenir non retrouvé dans la vérification."
+    )
+    return False
 
 
-def retrieve_memories_for_prompt(memories):
-    if not memories:
-        return ""
+def handle_explicit_memory_request(access_token, user_text):
+    """
+    Reconnaît les demandes explicites comme :
+    'Mémorise que mon projet s'appelle BAOBAB-729.'
+    """
+    import re
 
-    sections = []
+    text = (user_text or "").strip()
 
-    for memory in memories[:20]:
-        title = str(memory.get("title") or "").strip()
-        content = str(memory.get("content") or "").strip()
-        category = str(memory.get("category") or "general").strip()
+    if not text:
+        return None
 
-        if title and content:
-            sections.append(
-                f"- Catégorie : {category}\n"
-                f"  Souvenir : {title}\n"
-                f"  Information : {content}"
+    patterns = [
+        r"^(?:s'il te plaît[, ]*)?(?:mémorise|memorise|mémoriser|"
+        r"retiens|retenir|souviens[- ]toi|enregistre|"
+        r"sauvegarde|garde en mémoire|garde en memoire)"
+        r"(?:\s+que|\s*:)?\s+(.+)$",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+
+        if match:
+            information = match.group(1).strip()
+
+            if not information:
+                return None
+
+            # Évite d'enregistrer les mots de passe ou les clés.
+            sensitive_terms = (
+                "mot de passe",
+                "password",
+                "clé api",
+                "cle api",
+                "api key",
+                "secret key",
+                "token d'accès",
             )
 
-    return "\n".join(sections)[:12000]
+            if any(term in information.lower() for term in sensitive_terms):
+                return (
+                    "Je ne peux pas enregistrer de mot de passe, "
+                    "de clé API ou de secret."
+                )
 
+            success = save_memory(
+                access_token=access_token,
+                category="information_utilisateur",
+                title="Information à retenir",
+                content=information,
+            )
+
+            if success:
+                return (
+                    "✅ **Information enregistrée et vérifiée dans "
+                    "la mémoire persistante.**\n\n"
+                    f"Je retiendrai : {information}"
+                )
+
+            return (
+                "⚠️ Je n'ai pas pu confirmer l'enregistrement de cette "
+                "information. Vérifie la configuration Supabase et "
+                "les logs Render."
+            )
+
+    return None
+
+
+def summarize_and_store_memories(access_token, user_text, assistant_text):
+    """Extrait des informations durables sans interrompre le chat."""
+    if not client or not user_text.strip():
+        return
+
+    prompt = f"""
+Extrais au maximum trois informations durables explicitement données
+par l'utilisateur, utiles aux futures conversations.
+
+N'invente rien. N'enregistre aucun secret ni mot de passe.
+Si aucune information durable n'est présente, renvoie [].
+
+Réponds uniquement avec une liste JSON dont chaque élément contient :
+category, title et content.
+
+Message utilisateur :
+{user_text[:2500]}
+
+Réponse de l'assistant :
+{assistant_text[:1000]}
+"""
+
+    try:
+        result = generate_with_fallback(
+            prompt,
+            temperature=0.1,
+            max_output_tokens=800,
+        )
+
+        raw = (result.text or "").strip()
+
+        if raw.startswith("```"):
+            raw = raw.replace("```json", "", 1).replace("```", "").strip()
+
+        start = raw.find("[")
+        end = raw.rfind("]")
+
+        if start < 0 or end < start:
+            print("Aucun JSON de mémoire valide retourné par Gemini.")
+            return
+
+        extracted = json.loads(raw[start:end + 1])
+
+        if not isinstance(extracted, list):
+            return
+
+        for item in extracted[:3]:
+            if not isinstance(item, dict):
+                continue
+
+            title = str(item.get("title") or "").strip()
+            content = str(item.get("content") or "").strip()
+            category = str(item.get("category") or "general").strip()
+
+            if title and content:
+                save_memory(
+                    access_token,
+                    category,
+                    title,
+                    content,
+                )
+
+    except Exception as exc:
+        print("Erreur extraction mémoire :", repr(exc))
 
 # =========================================================
 # 7. GEMINI AVEC NOUVELLES TENTATIVES ET MODÈLES DE SECOURS
